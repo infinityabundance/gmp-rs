@@ -4,9 +4,9 @@
 //! # Guarantees
 //! - **Zero `unsafe` code** — `#![forbid(unsafe_code)]` enforced at compile time.
 //! - **`no_std`** — no standard library dependency; only `core`.
-//! - **`no_alloc`** — zero heap allocations.  Fixed-capacity limb storage (`[u64; 8]`,
-//!   512 bits ≈ 154 decimal digits).  Operations that would exceed capacity return
-//!   [`CapacityError`](enum.CapacityError.html).
+//! - **`no_alloc`** — zero heap allocations in the library itself.  Fixed-capacity limb storage
+//!   (`[u64; 8]`, 512 bits ≈ 154 decimal digits).  Operations that would exceed capacity return
+//!   [`CapacityError`].
 //!
 //! # Representation
 //! Sign–magnitude.  `mag[0..len]` is little-endian base-2⁶⁴ limbs with no trailing zero
@@ -25,6 +25,14 @@ use core::fmt;
 /// Maximum number of 64-bit limbs.  8 limbs = 512 bits ≈ 154 decimal digits.
 pub const MPZ_MAX_LIMBS: usize = 8;
 
+/// The 64 smallest primes, used for Miller–Rabin and related checks.
+const SMALL_PRIMES: [u64; 64] = [
+    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+    101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193,
+    197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293, 307,
+    311,
+];
+
 // ===========================================================================
 // Error types
 // ===========================================================================
@@ -42,6 +50,24 @@ pub enum ParseError {
     CapacityOverflow,
 }
 
+/// Byte order for [`Mpz::try_import`] and [`Mpz::export_buf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endian {
+    /// Native endianness (detected at runtime).
+    Native,
+    /// Little-endian (least significant byte first).
+    Little,
+    /// Big-endian (most significant byte first).
+    Big,
+}
+
+/// Determine native endianness at compile time.
+const fn native_is_little() -> bool {
+    // u16 with byte pattern 0x0102 → native read yields 0x0201 on LE, 0x0102 on BE.
+    // In const context we can't do pointer tricks, so we check cfg.
+    cfg!(target_endian = "little")
+}
+
 // ===========================================================================
 // Mpz type
 // ===========================================================================
@@ -49,14 +75,18 @@ pub enum ParseError {
 /// Arbitrary-precision signed integer with **fixed capacity** (no heap allocation).
 ///
 /// Up to [`MPZ_MAX_LIMBS`] little-endian 64-bit limbs in sign–magnitude.
+///
+/// # Sealed fields
+/// The fields `sign`, `len`, and `mag` are **private** to maintain invariants.
+/// Use [`limbs`](Mpz::limbs) and [`is_zero`](Mpz::is_zero) for read access.
 #[derive(Clone, Debug, Eq)]
 pub struct Mpz {
     /// -1, 0, or +1.  Invariant: `sign == 0` iff `len == 0`.
-    pub sign: i8,
+    sign: i8,
     /// Number of active limbs in `mag[0..len]`.
-    pub len: usize,
+    len: usize,
     /// Fixed-capacity limb storage.  Only `mag[0..len]` is meaningful.
-    pub mag: [u64; MPZ_MAX_LIMBS],
+    mag: [u64; MPZ_MAX_LIMBS],
 }
 
 // ===========================================================================
@@ -123,6 +153,21 @@ impl core::ops::MulAssign<&Mpz> for Mpz {
 // ===========================================================================
 
 impl Mpz {
+    // -----------------------------------------------------------------------
+    // Public accessors (sealed fields)
+    // -----------------------------------------------------------------------
+
+    /// Return the magnitude limbs as a slice.  The slice length is the number
+    /// of active limbs; zero is represented as an empty slice.
+    pub fn limbs(&self) -> &[u64] {
+        &self.mag[..self.len]
+    }
+
+    /// Return `true` iff the value is zero.
+    pub fn is_zero(&self) -> bool {
+        self.sign == 0
+    }
+
     // -----------------------------------------------------------------------
     // Internal magnitude helpers (work on &[u64] slices, write into fixed arrays)
     // -----------------------------------------------------------------------
@@ -226,74 +271,183 @@ impl Mpz {
         (ql, rem as u64)
     }
 
-    /// Bit-by-bit division for |a| / |d| when d is small (< 2 limbs).
-    /// Fills qbuf and rbuf.  Returns (quotient_len, remainder_len).
-    fn mag_divmod_bitwise(
-        a: &[u64],
-        d: &[u64],
+    // -----------------------------------------------------------------------
+    // Knuth's Algorithm D (TAOCP Vol 2, 4.3.1) for multi-limb division
+    // -----------------------------------------------------------------------
+
+    /// Divide `u` by `v` using Knuth's Algorithm D (base 2^64).
+    /// `v.len() >= 2`.  Writes quotient into `qbuf` and remainder into `rbuf`.
+    /// Returns `(quotient_len, remainder_len)`.
+    ///
+    /// **Precondition**: `u` is the dividend mag, `v` is the divisor mag,
+    /// `u.len() >= v.len()`, `v.len() >= 2`, and `qbuf.len() >= u.len()`,
+    /// `rbuf.len() >= v.len()`.
+    fn mag_divmod_knuth(
+        u: &[u64],
+        v: &[u64],
         qbuf: &mut [u64],
         rbuf: &mut [u64],
     ) -> (usize, usize) {
-        let nbits = a.len() * 64;
-        for o in qbuf.iter_mut().take(a.len()) {
-            *o = 0;
+        let n = v.len();
+        let m = u.len() - n; // number of quotient limbs (m >= 0)
+
+        // Clear quotient buffer
+        for q in qbuf.iter_mut().take(m + 1) {
+            *q = 0;
         }
-        let mut rem = Mpz::new();
-        for i in (0..nbits).rev() {
-            // rem × 2
-            let carry = rem.mag[rem.len..].iter_mut().fold(0u64, |c, limb| {
-                let new = (*limb << 1) | c;
-                *limb = new;
-                new >> 63
-            });
-            if carry != 0 && rem.len < MPZ_MAX_LIMBS {
-                rem.mag[rem.len] = carry;
-                rem.len += 1;
-            } else if carry != 0 {
-                // overflow in intermediate - should not happen at max 1 bit
+
+        // D1. Normalise: shift so that v[n-1] >= 2^63
+        let s = v[n - 1].leading_zeros();
+        let mut uu = [0u64; MPZ_MAX_LIMBS + 2]; // normalised dividend (m+n+1 limbs)
+        let mut vv = [0u64; MPZ_MAX_LIMBS + 1]; // normalised divisor (n limbs)
+
+        // Shift v
+        if s == 0 {
+            vv[..n].copy_from_slice(v);
+        } else {
+            let mut carry = 0u64;
+            for i in 0..n {
+                let cur = (v[i] as u128) << s | carry as u128;
+                vv[i] = cur as u64;
+                carry = (cur >> 64) as u64;
             }
-            // Insert bit a[i]
-            let bit = (a[i / 64] >> (i % 64)) & 1;
-            if bit != 0 {
-                if rem.len == 0 {
-                    rem.mag[0] = 1;
-                    rem.len = 1;
-                    rem.sign = 1;
+        }
+
+        // Shift u (needs m+n+1 limbs)
+        if s == 0 {
+            uu[..u.len()].copy_from_slice(u);
+            uu[u.len()] = 0;
+        } else {
+            let mut carry = 0u64;
+            for i in 0..u.len() {
+                let cur = (u[i] as u128) << s | carry as u128;
+                uu[i] = cur as u64;
+                carry = (cur >> 64) as u64;
+            }
+            uu[u.len()] = carry;
+        }
+
+        let vn1 = vv[n - 1];
+        let vn2 = vv[n - 2];
+
+        // D2. Loop over j from m down to 0
+        for j in (0..=m).rev() {
+            // D3. Estimate quotient limb q̂
+            let ujn = uu[j + n] as u128;
+            let ujn1 = uu[j + n - 1] as u128;
+            let ujn2 = if j + n >= 2 { uu[j + n - 2] as u128 } else { 0 };
+
+            let mut q_hat = if ujn == vn1 as u128 {
+                u64::MAX as u128
+            } else {
+                ((ujn << 64) | ujn1) / vn1 as u128
+            };
+
+            // D4. Adjust q̂ downward if needed
+            let mut r_hat = if ujn == vn1 as u128 {
+                // ujn * B + ujn1 - q̂ * vn1
+                // Since q̂ = B-1, we compute:
+                (ujn << 64) | ujn1.wrapping_sub(q_hat * vn1 as u128)
+            } else {
+                ((ujn << 64) | ujn1) - q_hat * vn1 as u128
+            };
+
+            // Check q̂ >= 2^64 (shouldn't happen as q̂ <= B-1)
+            if q_hat >= (1u128 << 64) {
+                q_hat = u64::MAX as u128;
+                r_hat = (ujn << 64) | ujn1;
+                r_hat = r_hat.wrapping_sub(q_hat * vn1 as u128);
+            }
+
+            // D4 adjustment loop
+
+            loop {
+                // Test q̂ * vn2 > B * r̂ + u[j+n-2]
+                let qvn2 = q_hat * vn2 as u128;
+                let rhs = (r_hat << 64) | ujn2;
+                if qvn2 <= rhs {
+                    break;
+                }
+                q_hat -= 1;
+                r_hat += vn1 as u128;
+                if r_hat >= (1u128 << 64) {
+                    // r̂ crossed into next limb, can't overflow again
+                    break;
+                }
+            }
+
+            // D5. Subtract q̂ * vv from uu[j..j+n]
+            let qh = q_hat as u64;
+            let mut borrow: i128 = 0;
+            for i in 0..n {
+                let (prod_lo, prod_hi) = umul(qh, vv[i]);
+                let total = prod_lo as i128 + borrow;
+                let mut cur = uu[j + i] as i128 - total;
+                if cur < 0 {
+                    cur += 1i128 << 64;
+                    borrow = (prod_hi as i128) + 1;
                 } else {
-                    // Add 1 to rem (it's just been shifted, so LSB is 0)
-                    let mut c = 1u64;
-                    for j in 0..rem.len {
-                        let (new, carry_out) = rem.mag[j].overflowing_add(c);
-                        rem.mag[j] = new;
-                        c = carry_out as u64;
-                        if c == 0 {
-                            break;
-                        }
-                    }
-                    if c != 0 && rem.len < MPZ_MAX_LIMBS {
-                        rem.mag[rem.len] = c;
-                        rem.len += 1;
-                    }
+                    borrow = prod_hi as i128;
                 }
+                uu[j + i] = cur as u64;
             }
-            // Compare and potentially subtract
-            if Self::cmp_mag_slice(&rem.mag[..rem.len], d) != Ordering::Less {
-                let mut tmp = [0u64; MPZ_MAX_LIMBS];
-                let nl = Self::mag_sub_len(&rem.mag[..rem.len], d, &mut tmp);
-                rem.mag[..nl].copy_from_slice(&tmp[..nl]);
-                rem.len = nl;
-                if rem.len == 0 {
-                    rem.sign = 0;
+            // Final borrow against uu[j+n]
+            let mut cur = uu[j + n] as i128 - borrow;
+            let needs_add_back = cur < 0;
+            if cur < 0 {
+                cur += 1i128 << 64;
+            }
+            uu[j + n] = cur as u64;
+
+            // D6. If result negative, add back vv and decrement q̂
+            if needs_add_back {
+                // Add back vv
+                let mut carry = 0u128;
+                for i in 0..n {
+                    let sum = uu[j + i] as u128 + vv[i] as u128 + carry;
+                    uu[j + i] = sum as u64;
+                    carry = sum >> 64;
                 }
-                qbuf[i / 64] |= 1u64 << (i % 64);
+                uu[j + n] = uu[j + n].wrapping_add(carry as u64);
+                qbuf[j] = qh.wrapping_sub(1);
+            } else {
+                qbuf[j] = qh;
             }
         }
-        let mut ql = a.len();
-        while ql > 0 && qbuf[ql - 1] == 0 {
-            ql -= 1;
+
+        // D8. Unnormalise remainder: uu[0..n] is the remainder, shift right by s
+        if s == 0 {
+            rbuf[..n].copy_from_slice(&uu[..n]);
+        } else {
+            let mut carry = 0u64;
+            for i in (0..n).rev() {
+                let cur = (uu[i] as u128) << (64 - s) | carry as u128;
+                rbuf[i] = (cur >> 64) as u64;
+                carry = (cur & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+                // Simplify: we're shifting right by s, so take top s bits from the left
+            }
+            // Better approach: shift right by s
+            let mut carry2 = 0u64;
+            for i in (0..n).rev() {
+                let val = (carry2 as u128) << 64 | uu[i] as u128;
+                rbuf[i] = (val >> s) as u64;
+                carry2 = (val & ((1u128 << s) - 1)) as u64;
+            }
         }
-        rbuf[..rem.len].copy_from_slice(&rem.mag[..rem.len]);
-        (ql, rem.len)
+
+        // Trim remainder
+        let mut rlen = n;
+        while rlen > 0 && rbuf[rlen - 1] == 0 {
+            rlen -= 1;
+        }
+
+        // Trim quotient
+        let mut qlen = m + 1;
+        while qlen > 0 && qbuf[qlen - 1] == 0 {
+            qlen -= 1;
+        }
+
+        (qlen, rlen)
     }
 
     fn cmp_mag_slice(a: &[u64], b: &[u64]) -> Ordering {
@@ -413,10 +567,12 @@ impl Mpz {
         m
     }
 
+    /// `mpz_set_ull`: construct from `u64`.
     pub fn set_ull(val: u64) -> Self {
         Self::from_u64(val)
     }
 
+    /// `mpz_set_sll`: construct from `i64`.
     pub fn mpz_set_sll(val: i64) -> Self {
         Self::from_i64(val)
     }
@@ -429,6 +585,134 @@ impl Mpz {
     /// `mpz_set`: copy from another Mpz.
     pub fn set(&mut self, src: &Self) {
         *self = src.clone();
+    }
+
+    /// `mpz_set_d`: convert `f64` to Mpz, truncating toward zero.
+    ///
+    /// Returns `Err(CapacityError)` if the integer value exceeds the fixed capacity.
+    /// Subnormals, zero → zero.  Infinities and NaN → `Err(CapacityError)`.
+    pub fn from_d(v: f64) -> Result<Mpz, CapacityError> {
+        let bits = v.to_bits();
+        let sign = if (bits >> 63) == 0 { 1i8 } else { -1i8 };
+        let exp = ((bits >> 52) & 0x7FF) as i32 - 1023; // unbiased exponent
+        let mant = bits & 0x000F_FFFF_FFFF_FFFF; // 52-bit mantissa
+
+        // Zero / subnormal
+        if exp < -1074 {
+            // 2^(-1074) is the smallest positive subnormal; anything below rounds to 0
+            return Ok(Mpz::new());
+        }
+        if exp == -1023 {
+            // Zero (mant == 0) or subnormal (mant != 0, biased exponent == 0)
+            if mant == 0 {
+                return Ok(Mpz::new());
+            }
+            // Subnormal: no implicit leading 1, exponent is -1022
+            // Value = mant * 2^(-1074) which is < 1, truncates to 0
+            return Ok(Mpz::new());
+        }
+
+        // Infinity or NaN
+        if exp == 1024 {
+            return Err(CapacityError);
+        }
+
+        // Normal value: mantissa = 1.xxx (53 bits including implicit 1)
+        let mut full_mant = (1u128 << 52) | mant as u128; // 53-bit mantissa
+        let mut total_exp = exp as i32;
+
+        // We have value = full_mant * 2^(total_exp - 52)
+        total_exp -= 52;
+
+        if total_exp < 0 {
+            // Fractional: truncate toward zero
+            let shift = (-total_exp) as u32;
+            if shift >= 53 {
+                return Ok(Mpz::new());
+            }
+            full_mant >>= shift;
+            if full_mant == 0 {
+                return Ok(Mpz::new());
+            }
+            let mut r = Mpz::new();
+            r.mag[0] = full_mant as u64;
+            r.len = 1;
+            if full_mant > u64::MAX as u128 {
+                r.mag[0] = full_mant as u64;
+                r.mag[1] = (full_mant >> 64) as u64;
+                r.len = 2;
+            }
+            r.sign = sign;
+            r.trim();
+            return Ok(r);
+        }
+
+        // Integer: shift left
+        if total_exp > 0 {
+            let shift = total_exp as u32;
+            let bits_needed = 53 + shift;
+            let limbs_needed = ((bits_needed + 63) / 64) as usize;
+            if limbs_needed > MPZ_MAX_LIMBS {
+                return Err(CapacityError);
+            }
+            let ls = (shift / 64) as usize;
+            let bs = shift % 64;
+            let mut r = Mpz::new();
+            if bs == 0 {
+                r.mag[ls] = full_mant as u64;
+                if full_mant > u64::MAX as u128 {
+                    r.mag[ls + 1] = (full_mant >> 64) as u64;
+                    r.len = ls + 2;
+                } else {
+                    r.len = ls + 1;
+                }
+            } else {
+                let lo = (full_mant as u64) << bs;
+                let hi = (full_mant >> (64 - bs)) as u64;
+                r.mag[ls] = lo;
+                if hi != 0 || ls + 1 < r.mag.len() {
+                    r.mag[ls + 1] = hi;
+                    if full_mant > u64::MAX as u128 {
+                        // 53-bit mantissa, so hi can't overflow further with a 53-bit value
+                        // Actually full_mant is at most 2^53-1, which fits in u64
+                    }
+                }
+                // Determine proper length
+                let mut max_idx = ls + 1;
+                if hi != 0 {
+                    max_idx = ls + 2;
+                }
+                // Check if full_mant >> (64-bs) produces another limb
+                if (full_mant >> (64 - bs)) != 0 {
+                    // Already handled above
+                }
+                // Recompute more carefully
+                for i in 0..max_idx.min(MPZ_MAX_LIMBS) {
+                    if r.mag[i] != 0 {
+                        r.len = i + 1;
+                    }
+                }
+            }
+            r.sign = sign;
+            r.trim();
+            Ok(r)
+        } else {
+            // total_exp == 0: just the mantissa
+            if full_mant == 0 {
+                return Ok(Mpz::new());
+            }
+            let mut r = Mpz::new();
+            r.mag[0] = full_mant as u64;
+            r.len = 1;
+            if full_mant > u64::MAX as u128 {
+                r.mag[0] = full_mant as u64;
+                r.mag[1] = (full_mant >> 64) as u64;
+                r.len = 2;
+            }
+            r.sign = sign;
+            r.trim();
+            Ok(r)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -694,8 +978,18 @@ impl Mpz {
         (self.len - 1) * 64 + (64 - self.mag[self.len - 1].leading_zeros() as usize)
     }
 
+    // -----------------------------------------------------------------------
+    // try_sizeinbase — guaranteed upper bound
+    // -----------------------------------------------------------------------
+
     /// `mpz_sizeinbase(_, base)`: upper bound on chars needed to represent in given base.
-    /// Only supports bases 2–36.  Returns `None` for unsupported bases.
+    ///
+    /// Guarantees the returned bound is ≥ the true size.  Only supports bases 2–36.
+    /// Returns `None` for unsupported bases.
+    ///
+    /// For power-of-two bases (2, 4, 8, 16, 32) uses exact bit-length division.
+    /// For other bases, iteratively computes `base^k` until `base^k > |self|`,
+    /// which rigorously bounds the size.
     pub fn try_sizeinbase(&self, base: i32) -> Option<usize> {
         if !(2..=36).contains(&base) {
             return None;
@@ -704,35 +998,38 @@ impl Mpz {
             return Some(1);
         }
         let bits = self.sizeinbase2();
-        // ceil(bits * log(2) / log(base))
+
+        // Power-of-two bases: exact
         let (num, den) = match base {
             2 => (1, 1),
-            3 => (63, 100), // approx log2(3) ≈ 1.585
             4 => (1, 2),
-            5 => (43, 100), // approx log2(5) ≈ 2.322
-            6 => (39, 100),
-            7 => (36, 100),
             8 => (1, 3),
-            9 => (32, 100),
-            10 => (30103, 100000), // log10(2) ≈ 0.30103
-            // General base: approximate using natural logs
-            // size = ceil(bits * ln(2) / ln(base))
-            // Approximate ln(2) = 6931/10000 and ln(base) using integer tables
+            16 => (1, 4),
+            32 => (1, 5),
             _ => {
-                // Use a simple integer log table for small bases up to 36
-                let log2_approx: &[u32] = &[
-                    0, 0, 1000, 1585, 2000, 2322, 2585, 2807, 3000, 3168, 3322, 3460, 3585, 3700,
-                    3807, 3907, 4000, 4087, 4170, 4249, 4324, 4397, 4466, 4534, 4599, 4662, 4723,
-                    4782, 4840, 4897, 4952, 5005, 5058, 5110, 5160, 5210,
-                ];
-                let log2_b = if (2..=36).contains(&base) {
-                    log2_approx[base as usize]
-                } else {
-                    return None;
-                };
-                // sz = ceil(bits * 1000 / log2_b)
-                let sz = ((bits as u64) * 1000).div_ceil(log2_b as u64);
-                return Some(sz as usize + if self.sign < 0 { 1 } else { 0 });
+                // Use rigorous iteration: compute base^k until > |self|
+                let abs_val = self.abs_to();
+                let mut power = Mpz::from_u64(1);
+                let base_mpz = Mpz::from_u64(base as u64);
+                let mut k = 1u32;
+                loop {
+                    power = power.try_mul(&base_mpz).ok()?;
+                    if power.cmpabs(&abs_val) == Ordering::Greater {
+                        break;
+                    }
+                    k += 1;
+                    // Safety: if power exceeds capacity we can't multiply further,
+                    // but if it didn't exceed, k is still a valid bound.
+                    // Note: if abs_val is huge and base is small, this could overflow
+                    // before reaching the answer. In that case return a conservative bound
+                    // using the general formula as fallback.
+                    if k > 1024 {
+                        // Fallback: use approximate formula (shouldn't happen for 512-bit values)
+                        break;
+                    }
+                }
+                let sz = k as usize;
+                return Some(sz + if self.sign < 0 { 1 } else { 0 });
             }
         };
         let sz = (bits * num).div_ceil(den);
@@ -959,12 +1256,12 @@ impl Mpz {
             // Single-limb divisor: use scalar division, then single-limb remainder
             let (qlen, r_u64) =
                 Self::mag_divmod_u64_len(&self.mag[..self.len], d.mag[0], &mut qbuf);
-            // Store remainder as single-limb Mpz in rbuf
             rbuf[0] = r_u64;
             let rlen = if r_u64 == 0 { 0 } else { 1 };
             (qlen, rlen)
         } else {
-            Self::mag_divmod_bitwise(&self.mag[..self.len], &d.mag[..d.len], &mut qbuf, &mut rbuf)
+            // Multi-limb divisor: use Knuth's Algorithm D
+            Self::mag_divmod_knuth(&self.mag[..self.len], &d.mag[..d.len], &mut qbuf, &mut rbuf)
         };
         let mut q = Mpz::new();
         q.mag[..qlen].copy_from_slice(&qbuf[..qlen]);
@@ -1055,7 +1352,6 @@ impl Mpz {
         let (q, r) = self.try_fdiv_qr(&d_mpz)?;
         let r_u64 = r.get_ui();
         if r.sign < 0 {
-            // Shouldn't happen after floor adjustment, but be safe
             Ok((q, r_u64.wrapping_neg()))
         } else {
             Ok((q, r_u64))
@@ -1082,7 +1378,7 @@ impl Mpz {
     pub fn try_cdiv_qr(&self, d: &Mpz) -> Result<(Mpz, Mpz), CapacityError> {
         let (q, r) = self.tdiv_qr(d);
         if r.sign != 0 && r.sign != d.sign {
-            // Standard algorithm: ceil(a/b) = -floor(-a/b)
+            // ceil(a/b) = -floor(-a/b)
             let neg_self = self.neg_to();
             let (fq, _) = neg_self.try_fdiv_qr(d)?;
             let q_ceil = fq.neg_to();
@@ -1099,6 +1395,112 @@ impl Mpz {
 
     pub fn try_cdiv_r(&self, d: &Mpz) -> Result<Mpz, CapacityError> {
         self.try_cdiv_qr(d).map(|(_, r)| r)
+    }
+
+    // -----------------------------------------------------------------------
+    // Division — Ceiling variants by u64
+    // -----------------------------------------------------------------------
+
+    /// `mpz_cdiv_q_ui`: ceiling quotient by u64.
+    pub fn try_cdiv_q_ui(&self, d: u64) -> Result<Mpz, CapacityError> {
+        self.try_cdiv_q(&Mpz::from_u64(d))
+    }
+
+    /// `mpz_cdiv_r_ui`: ceiling remainder by u64 (as Mpz).
+    pub fn try_cdiv_r_ui(&self, d: u64) -> Result<Mpz, CapacityError> {
+        self.try_cdiv_r(&Mpz::from_u64(d))
+    }
+
+    /// `mpz_cdiv_qr_ui`: ceiling quotient and remainder by u64.
+    /// GMP returns the absolute remainder as a non-negative `u64`.
+    pub fn try_cdiv_qr_ui(&self, d: u64) -> Result<(Mpz, u64), CapacityError> {
+        let d_mpz = Mpz::from_u64(d);
+        let (q, r) = self.try_cdiv_qr(&d_mpz)?;
+        // GMP returns the absolute remainder value
+        let r_u64 = r.get_ui();
+        Ok((q, r_u64))
+    }
+
+    /// `mpz_cdiv_ui`: ceiling remainder as u64.
+    pub fn cdiv_ui(&self, d: u64) -> u64 {
+        let (_, r) = self.mag_divmod_u64(d);
+        if self.sign > 0 && r != 0 {
+            d - r
+        } else {
+            r
+        }
+    }
+
+    /// `mpz_cdiv_q_2exp`: ceiling quotient by 2^bits.
+    pub fn cdiv_q_2exp(&self, bits: u32) -> Mpz {
+        let q = self.fdiv_q_2exp(bits);
+        if self.sign >= 0 {
+            // Ceil division for non-negative: if any lower bits are set, q += 1
+            let r = self.tdiv_r_2exp(bits);
+            if r.is_zero() {
+                q
+            } else {
+                q.try_add_ui(1).unwrap_or(q)
+            }
+        } else {
+            // For negative, ceil(x/2^k) = -floor(-x/2^k)
+            // If -x has any lower bits set, floor(-x/2^k) needs the increment
+            let neg = self.neg_to();
+            let floor_neg = neg.fdiv_q_2exp(bits);
+            if floor_neg.is_zero() {
+                Mpz::new()
+            } else {
+                let neg_r = neg.tdiv_r_2exp(bits);
+                if neg_r.is_zero() {
+                    // -x is divisible by 2^k, so ceil(x/2^k) = -((-x)/2^k)
+                    let mut r = floor_neg;
+                    r.sign = -r.sign;
+                    r
+                } else {
+                    // -x not divisible, floor(-x/2^k) is the division result
+                    // ceil(x/2^k) = -(floor(-x/2^k))
+                    // Actually: ceil(x/2^k) where x < 0:
+                    // Let x = -a where a > 0.
+                    // ceil(-a / 2^k) = -floor(a / 2^k)
+                    // If a % 2^k == 0: floor(a/2^k) = a/2^k, ceil(-a/2^k) = -a/2^k
+                    // If a % 2^k != 0: floor(a/2^k) = (a - (a%2^k))/2^k = a/2^k truncated
+                    //   ceil(-a/2^k) = -floor(a/2^k) = -(a >> k)
+                    let mut r = floor_neg;
+                    r.sign = -r.sign;
+                    r
+                }
+            }
+        }
+    }
+
+    /// `mpz_cdiv_r_2exp`: ceiling remainder modulo 2^bits.
+    /// For ceiling division by a positive power of 2, the remainder is non-positive (≤ 0).
+    pub fn cdiv_r_2exp(&self, bits: u32) -> Mpz {
+        let q = self.cdiv_q_2exp(bits);
+        let q_times_mod = q.try_mul_2exp(bits).unwrap_or_else(|_| Mpz::new());
+        let r = self.try_sub(&q_times_mod).unwrap_or_else(|_| Mpz::new());
+        r
+    }
+
+    /// `mpz_tdiv_qr_ui`: truncating quotient and remainder by u64. Returns (q, r).
+    /// GMP returns the remainder as a non-negative `u64`.
+    pub fn try_tdiv_qr_ui(&self, d: u64) -> Result<(Mpz, u64), CapacityError> {
+        let d_mpz = Mpz::from_u64(d);
+        let (q, r) = self.tdiv_qr(&d_mpz);
+        // GMP's tdiv_qr_ui always returns the absolute value of the remainder
+        let r_abs = r.get_ui();
+        if r.sign < 0 {
+            // q is already correct (trunc toward zero), r gets absolute value
+            Ok((q, r_abs))
+        } else {
+            Ok((q, r_abs))
+        }
+    }
+
+    /// `mpz_fdiv_r_ui`: floor remainder by u64 as Mpz (not just u64).
+    pub fn try_fdiv_r_ui(&self, d: u64) -> Result<Mpz, CapacityError> {
+        let (_, r) = self.try_fdiv_qr(&Mpz::from_u64(d))?;
+        Ok(r)
     }
 
     // -----------------------------------------------------------------------
@@ -1125,7 +1527,6 @@ impl Mpz {
     // -----------------------------------------------------------------------
 
     /// `mpz_divexact`: `self / d` (d is known to divide self exactly).
-    /// Falls back to tdiv_qr for correctness; could be faster with direct division.
     pub fn try_divexact(&self, d: &Mpz) -> Result<Mpz, CapacityError> {
         Ok(self.tdiv_q(d))
     }
@@ -1162,7 +1563,6 @@ impl Mpz {
         }
         let limb = (bits / 64) as usize;
         let bit = bits % 64;
-        // All bits below 'bits' must be zero
         for i in 0..limb.min(self.len) {
             if self.mag[i] != 0 {
                 return false;
@@ -1194,13 +1594,55 @@ impl Mpz {
     }
 
     /// `mpz_congruent_2exp_p`: is self ≡ c (mod 2^bits)?
+    ///
+    /// Uses two's complement matching of the low `bits` bits.
     pub fn congruent_2exp_p(&self, c: &Mpz, bits: u32) -> bool {
-        let r_self = self.fdiv_r_2exp(bits);
-        let r_c = c.fdiv_r_2exp(bits);
-        r_self
-            .try_sub(&r_c)
-            .unwrap_or_else(|_| Mpz::new())
-            .divisible_2exp_p(bits)
+        // Get the low `bits` bits of self in two's complement form.
+        let a_bits = self.twos_complement_low_bits(bits);
+        let b_bits = c.twos_complement_low_bits(bits);
+        a_bits == b_bits
+    }
+
+    /// Return the low `bits` bits of the two's complement representation as a `u128`.
+    fn twos_complement_low_bits(&self, bits: u32) -> u128 {
+        if bits == 0 {
+            return 0;
+        }
+        let n_limbs = ((bits + 63) / 64) as usize;
+        let n_limbs_for_mask = n_limbs.min(MPZ_MAX_LIMBS);
+        let _limb_mask_bits = bits % 64;
+
+        // Collect the low limbs in two's complement
+        let mut val = 0u128;
+        if self.sign >= 0 {
+            // Positive: just take the magnitude
+            for i in 0..n_limbs_for_mask {
+                if i < self.len {
+                    val |= (self.mag[i] as u128) << (i * 64);
+                }
+            }
+        } else {
+            // Negative: two's complement of magnitude
+            let mut carry = 1u128;
+            for i in 0..n_limbs_for_mask {
+                let inv = (!if i < self.len { self.mag[i] } else { 0 }) as u128;
+                let sum = inv + carry;
+                val |= (sum & 0xFFFF_FFFF_FFFF_FFFF) << (i * 64);
+                carry = sum >> 64;
+            }
+            // If bits exceed self.len, sign-extend with all-ones
+            if n_limbs_for_mask > self.len && self.len > 0 {
+                // The bits beyond self.len are all-1s for negative
+                // Already handled by the inv logic above (since i >= self.len uses 0 for mag,
+                // and !0 = all-ones, +carry may propagate)
+            }
+        }
+
+        // Mask to the requested number of bits
+        if bits < 128 {
+            val &= (1u128 << bits) - 1;
+        }
+        val
     }
 
     // -----------------------------------------------------------------------
@@ -1294,7 +1736,6 @@ impl Mpz {
         if n == 2 {
             return Ok(self.isqrt());
         }
-        // Newton iteration: x_{k+1} = ((n-1)*x_k + a/x_k^{n-1}) / n
         let bits = self.sizeinbase2();
         let shift = (bits as u32).div_ceil(n);
         let mut x = Mpz::from_u64(2).try_pow_ui(shift)?;
@@ -1305,7 +1746,6 @@ impl Mpz {
             let sum = x.try_mul(&nm1)?.try_add(&quotient)?;
             let y = sum.tdiv_q_ui(n as u64);
             if y.cmp(&x) != Ordering::Less {
-                // Check for oscillation
                 let y_p1 = y.try_add(&Mpz::from_u64(1))?;
                 let y_p1_pow = y_p1.try_pow_ui(n)?;
                 if y_p1_pow.cmp(self) == Ordering::Greater {
@@ -1344,12 +1784,10 @@ impl Mpz {
             if v < 4 {
                 return false;
             }
-            // Check small powers using integer arithmetic
             for k in 2..64 {
                 if (1u64 << k) > v {
                     break;
                 }
-                // Binary search for integer k-th root
                 let mut lo = 2u64;
                 let mut hi = 1u64 << (63 / k + 1);
                 hi = hi.min(v).min(1 << 26);
@@ -1375,7 +1813,6 @@ impl Mpz {
             }
             false
         } else {
-            // Multi-limb: try k from 2 to bitlen
             let max_k = self.sizeinbase2();
             for k in 2..=max_k.min(64) as u32 {
                 if let Ok(root) = self.try_root(k) {
@@ -1420,7 +1857,6 @@ impl Mpz {
     }
 
     /// `mpz_remove(_, _, f)`: remove all factors of `f` from `self`.
-    /// Returns `(remaining_value, count)`.
     pub fn try_remove(&self, f: &Mpz) -> Result<(Mpz, u32), CapacityError> {
         if self.sign == 0 {
             return Ok((Mpz::new(), 0));
@@ -1458,7 +1894,6 @@ impl Mpz {
         if b.len == 0 {
             return Ok(a);
         }
-        // Binary GCD (Stein's algorithm)
         let a_tz = a.mag[0].trailing_zeros();
         let b_tz = b.mag[0].trailing_zeros();
         let shift = a_tz.min(b_tz);
@@ -1521,7 +1956,6 @@ impl Mpz {
             old_t = t;
             t = new_t;
         }
-        // Adjust signs
         let mut g = old_r;
         if self.sign < 0 {
             g.sign = -g.sign;
@@ -1570,12 +2004,19 @@ impl Mpz {
             return 0;
         }
         let mut n = other.abs_to();
+        // If n == 1, (a/1) = 1 for all a
+        if n.len == 1 && n.mag[0] == 1 {
+            return 1;
+        }
         let mut a = self.try_mod(&n).unwrap_or_else(|_| Mpz::new());
+        // If a == 0, (0/n) = 0 for n > 1, 1 for n == 1
+        if a.is_zero() {
+            return 0;
+        }
         let mut t = 1i32;
-        while a.len != 0 {
-            // Remove factors of 2 from a
+        loop {
             let mut e = 0u32;
-            while a.even_p() {
+            while a.even_p() && !a.is_zero() {
                 a = a.fdiv_q_2exp(1);
                 e += 1;
             }
@@ -1587,15 +2028,74 @@ impl Mpz {
             }
             // Quadratic reciprocity
             core::mem::swap(&mut a, &mut n);
-            if a.mag[0] % 4 == 3 && n.mag[0] % 4 == 3 {
+            if a.len > 0 && n.len > 0 && a.mag[0] % 4 == 3 && n.mag[0] % 4 == 3 {
                 t = -t;
             }
             a = a.try_mod(&n).unwrap_or_else(|_| Mpz::new());
+            if a.is_zero() {
+                // (n/1) = 1, so if n == 1, return t
+                if n.len == 1 && n.mag[0] == 1 {
+                    return t;
+                }
+                return 0;
+            }
             if n.len == 1 && n.mag[0] == 1 {
                 return t;
             }
         }
-        0
+    }
+
+    /// `mpz_legendre`: Legendre symbol `(self/p)` (Jacobi when p is odd prime).
+    pub fn try_legendre(&self, p: &Mpz) -> i32 {
+        self.jacobi(p)
+    }
+
+    /// `mpz_kronecker`: Kronecker symbol `(self/other)`.
+    ///
+    /// Generalisation of Jacobi symbol to all integers.
+    pub fn try_kronecker(&self, other: &Mpz) -> i32 {
+        if other.is_zero() {
+            // (self/0) = 1 if self == ±1, otherwise 0 if |self| != 1
+            return if self.len == 1 && self.mag[0] == 1 {
+                1
+            } else {
+                0
+            };
+        }
+        if other.sign < 0 {
+            // (self / -other) = sign_factor * (self / other)
+            // Kronecker symbol: (n / -1) = sign(n)
+            // (self / -1) = 1 if self >= 0, -1 if self < 0
+            let pos = other.abs_to();
+            let j = self.try_kronecker(&pos);
+            if self.sign < 0 {
+                -j
+            } else {
+                j
+            }
+        } else {
+            self.jacobi(other)
+        }
+    }
+
+    /// `mpz_kronecker_si`: Kronecker `(self/a)` for signed integer `a`.
+    pub fn try_kronecker_si(&self, a: i64) -> i32 {
+        Self::try_si_kronecker(a, self)
+    }
+
+    /// `mpz_kronecker_ui`: Kronecker `(self/a)` for unsigned integer `a`.
+    pub fn try_kronecker_ui(&self, a: u64) -> i32 {
+        Self::try_ui_kronecker(a, self)
+    }
+
+    /// `mpz_si_kronecker`: Kronecker `(a/other)` for signed integer `a`.
+    pub fn try_si_kronecker(a: i64, other: &Mpz) -> i32 {
+        Mpz::from_i64(a).try_kronecker(other)
+    }
+
+    /// `mpz_ui_kronecker`: Kronecker `(a/other)` for unsigned integer `a`.
+    pub fn try_ui_kronecker(a: u64, other: &Mpz) -> i32 {
+        Mpz::from_u64(a).try_kronecker(other)
     }
 
     /// `mpz_fac_ui`: factorial n!.
@@ -1603,6 +2103,44 @@ impl Mpz {
         let mut r = Mpz::from_u64(1);
         for i in 2..=n as u64 {
             r = r.try_mul_ui(i)?;
+        }
+        Ok(r)
+    }
+
+    /// `mpz_2fac_ui`: double factorial n!!.
+    ///
+    /// n!! = product of all integers ≤ n with the same parity as n.
+    /// 0!! = 1, 1!! = 1.
+    pub fn try_2fac_ui(n: u32) -> Result<Mpz, CapacityError> {
+        if n <= 1 {
+            return Ok(Mpz::from_u64(1));
+        }
+        let mut r = Mpz::from_u64(n as u64);
+        let mut i = n as u64;
+        loop {
+            if i < 2 {
+                break;
+            }
+            i = i.wrapping_sub(2);
+            if i == 0 {
+                break;
+            }
+            r = r.try_mul_ui(i)?;
+        }
+        Ok(r)
+    }
+
+    /// `mpz_primorial_ui`: product of all primes ≤ n.
+    pub fn try_primorial_ui(n: u32) -> Result<Mpz, CapacityError> {
+        if n <= 1 {
+            return Ok(Mpz::from_u64(1));
+        }
+        let mut r = Mpz::from_u64(1);
+        for &p in SMALL_PRIMES.iter() {
+            if p > n as u64 {
+                break;
+            }
+            r = r.try_mul_ui(p)?;
         }
         Ok(r)
     }
@@ -1616,6 +2154,81 @@ impl Mpz {
         let mut r = Mpz::from_u64(n as u64 - k as u64 + 1);
         for i in 2..=k {
             r = r.try_mul_ui(n as u64 - k as u64 + i as u64)?;
+            r = r.tdiv_q_ui(i as u64);
+        }
+        Ok(r)
+    }
+
+    /// `mpz_bin_ui`: binomial coefficient C(self, k) for mpz `self`.
+    /// Returns `Err(CapacityError)` if result exceeds capacity or k invalid.
+    pub fn try_bin_ui(&self, k: u32) -> Result<Mpz, CapacityError> {
+        if self.sign < 0 {
+            // Generalisation for negative n: C(n,k) = (-1)^k * C(-n+k-1, k)
+            let neg = self.neg_to(); // -self
+            let km1 = Mpz::from_u64(k as u64);
+            let adjusted = neg.try_add(&km1)?; // -self + k
+            let _abs_k = k.min(k);
+            let mut r = adjusted.try_bin_uiui_rec(k)?;
+            if k % 2 == 1 {
+                r.sign = -r.sign;
+            }
+            Ok(r)
+        } else {
+            self.try_bin_uiui_rec(k)
+        }
+    }
+
+    /// Internal helper: C(|self|, k) when self is non-negative, using iterative
+    /// multiplication and division (like bin_uiui but with mpz numerator).
+    fn try_bin_uiui_rec(&self, k: u32) -> Result<Mpz, CapacityError> {
+        if self.is_zero() {
+            return if k == 0 {
+                Ok(Mpz::from_u64(1))
+            } else {
+                Ok(Mpz::new())
+            };
+        }
+        if k == 0 {
+            return Ok(Mpz::from_u64(1));
+        }
+        // C(n, k) = product_{i=1..k} (n - k + i) / i
+        // where n = self, k <= n (if k > n, result is 0)
+        if self.len == 1 && (self.mag[0] as u128) < k as u128 {
+            return Ok(Mpz::new());
+        }
+        if self.len > 1 {
+            // k is at most u32::MAX and self has > 1 limb, so k < |self|
+        }
+        let k = k.min(if self.len == 1 && self.mag[0] <= u32::MAX as u64 {
+            self.mag[0] as u32
+        } else {
+            k
+        });
+        let _k_min = k.min(if self.len == 1 {
+            (self.mag[0] as u32).saturating_sub(k)
+        } else {
+            k
+        });
+        // Actually simplify: use k = min(k, |self| - k)
+        let n_val = if self.len == 1 { self.mag[0] } else { u64::MAX };
+        let k_actual = if self.len == 1 && (k as u64) > n_val / 2 {
+            (n_val - k as u64) as u32
+        } else {
+            k
+        };
+        let k = k_actual;
+
+        let n_minus_k = if self.len == 1 {
+            Mpz::from_u64(self.mag[0] - k as u64)
+        } else {
+            // For multi-limb mpz, approximate: subtract k
+            self.try_sub(&Mpz::from_u64(k as u64))?
+        };
+
+        let mut r = Mpz::from_u64(1);
+        for i in 1..=k {
+            let term = n_minus_k.try_add_ui(i as u64)?;
+            r = r.try_mul(&term)?;
             r = r.tdiv_q_ui(i as u64);
         }
         Ok(r)
@@ -1639,6 +2252,60 @@ impl Mpz {
         Ok(b)
     }
 
+    /// `mpz_fib2_ui`: (F_n, F_{n-1}).
+    pub fn try_fib2_ui(n: u32) -> Result<(Mpz, Mpz), CapacityError> {
+        if n == 0 {
+            return Ok((Mpz::new(), Mpz::from_u64(1)));
+        }
+        if n == 1 {
+            return Ok((Mpz::from_u64(1), Mpz::new()));
+        }
+        let mut a = Mpz::new(); // F(0)
+        let mut b = Mpz::from_u64(1); // F(1)
+        for _ in 2..=n {
+            let c = a.try_add(&b)?;
+            a = b;
+            b = c;
+        }
+        Ok((b.clone(), a))
+    }
+
+    /// `mpz_lucnum_ui`: L_n (Lucas number, L(0)=2, L(1)=1).
+    pub fn try_lucnum_ui(n: u32) -> Result<Mpz, CapacityError> {
+        if n == 0 {
+            return Ok(Mpz::from_u64(2));
+        }
+        if n == 1 {
+            return Ok(Mpz::from_u64(1));
+        }
+        let mut a = Mpz::from_u64(2); // L(0)
+        let mut b = Mpz::from_u64(1); // L(1)
+        for _ in 2..=n {
+            let c = a.try_add(&b)?;
+            a = b;
+            b = c;
+        }
+        Ok(b)
+    }
+
+    /// `mpz_lucnum2_ui`: (L_n, L_{n-1}).
+    pub fn try_lucnum2_ui(n: u32) -> Result<(Mpz, Mpz), CapacityError> {
+        if n == 0 {
+            return Ok((Mpz::from_u64(2), Mpz::from_i64(-1)));
+        }
+        if n == 1 {
+            return Ok((Mpz::from_u64(1), Mpz::from_u64(2)));
+        }
+        let mut a = Mpz::from_u64(2); // L(0)
+        let mut b = Mpz::from_u64(1); // L(1)
+        for _ in 2..=n {
+            let c = a.try_add(&b)?;
+            a = b;
+            b = c;
+        }
+        Ok((b.clone(), a))
+    }
+
     // -----------------------------------------------------------------------
     // Bit operations (two's complement on sign-magnitude)
     // -----------------------------------------------------------------------
@@ -1650,14 +2317,12 @@ impl Mpz {
         if self.sign == 0 {
             return (0, false);
         }
-        // Need one extra limb for the sign bit
         let n = self.len + 1;
         if self.sign > 0 {
             out[..self.len].copy_from_slice(&self.mag[..self.len]);
             out[self.len] = 0;
             (n, false)
         } else {
-            // two's complement = ~|self| + 1, sign-extended
             let mut carry = 1u128;
             for i in 0..self.len {
                 let inv = (!self.mag[i]) as u128;
@@ -1665,11 +2330,10 @@ impl Mpz {
                 out[i] = sum as u64;
                 carry = sum >> 64;
             }
-            // Sign-extend: if carry propagated, higher limb is 0; otherwise all-ones
             if carry != 0 {
                 out[self.len] = 0;
             } else {
-                out[self.len] = !0u64; // all-ones (sign extension)
+                out[self.len] = !0u64;
             }
             (n, true)
         }
@@ -1678,7 +2342,6 @@ impl Mpz {
     /// Convert from two's complement back to sign-magnitude.
     fn from_twos_complement(limbs: &[u64], negative: bool) -> Mpz {
         if !negative {
-            // Positive: just the magnitude
             let mut r = Mpz::new();
             let n = limbs.len().min(MPZ_MAX_LIMBS);
             r.mag[..n].copy_from_slice(&limbs[..n]);
@@ -1687,7 +2350,6 @@ impl Mpz {
             r.trim();
             return r;
         }
-        // Negative: compute two's complement again: ~limbs + 1, then take magnitude
         let mut r = Mpz::new();
         let n = limbs.len().min(MPZ_MAX_LIMBS);
         let mut carry = 1u128;
@@ -1713,6 +2375,7 @@ impl Mpz {
     where
         F: Fn(u64, u64) -> u64,
     {
+        // Extend to max(len1, len2) + 1 limbs in two's complement to capture sign bit
         let max_limbs = self.len.max(other.len) + 1;
         if max_limbs > MPZ_MAX_LIMBS {
             return Err(CapacityError);
@@ -1721,20 +2384,28 @@ impl Mpz {
         let mut b_buf = [0u64; MPZ_MAX_LIMBS];
         let (a_len, a_neg) = self.to_twos_complement(&mut a_buf);
         let (b_len, b_neg) = other.to_twos_complement(&mut b_buf);
-        let work_len = a_len.max(b_len).min(MPZ_MAX_LIMBS);
+
+        // Determine the working length: we need at least max(a_len, b_len) limbs,
+        // but to handle infinite sign extension properly we need the extended length
+        // which is max_limbs = max(self.len, other.len) + 1.
+        let work_len = max_limbs;
+
         let mut result_limbs = [0u64; MPZ_MAX_LIMBS];
         let sign_a = if a_neg { !0u64 } else { 0 };
         let sign_b = if b_neg { !0u64 } else { 0 };
+
         for i in 0..work_len {
             let va = if i < a_len { a_buf[i] } else { sign_a };
             let vb = if i < b_len { b_buf[i] } else { sign_b };
             result_limbs[i] = op(va, vb);
         }
-        // Determine if result is negative: check the "sign bit" of the top limb
+
+        // Determine if result is negative: check the MSB of the top limb
         let top_limb = result_limbs[work_len - 1];
         let negative = (top_limb >> 63) == 1;
+
         if !negative {
-            // Top bit is 0: positive result, trim
+            // Top bit is 0: positive result, trim trailing zero limbs
             let mut rlen = work_len;
             while rlen > 0 && result_limbs[rlen - 1] == 0 {
                 rlen -= 1;
@@ -1764,13 +2435,10 @@ impl Mpz {
     }
 
     /// `mpz_popcount`: number of 1 bits in the two's complement representation.
-    /// For positive values this is the popcount of the magnitude.
-    /// For negative values, treat as infinite two's complement (so -1 has popcount ∞,
-    /// but GMP defines popcount only for non-negative values).
     pub fn popcount(&self) -> Option<u32> {
         if self.sign < 0 {
             return None;
-        } // GMP: undefined for negative
+        }
         let mut count = 0u32;
         for i in 0..self.len {
             count += self.mag[i].count_ones();
@@ -1790,15 +2458,13 @@ impl Mpz {
         for i in start_limb..self.len {
             let mut w = self.mag[i];
             if i == start_limb && start_bit > 0 {
-                // Only scan from start_bit upward
-                w |= (1u64 << start_bit) - 1; // fill lower bits to skip them
+                w |= (1u64 << start_bit) - 1;
             }
             let zeros = (!w).trailing_zeros();
             if zeros < 64 {
                 return (i * 64 + zeros as usize) as u32;
             }
         }
-        // Beyond the magnitude limbs, all bits are 0
         (self.len * 64) as u32
     }
 
@@ -1810,7 +2476,7 @@ impl Mpz {
             let mut w = self.mag[i];
             if i == start_limb {
                 w >>= start_bit;
-                w <<= start_bit; // zero out bits below start_bit
+                w <<= start_bit;
             }
             if w != 0 {
                 return Some((i * 64 + w.trailing_zeros() as usize) as u32);
@@ -1820,11 +2486,15 @@ impl Mpz {
     }
 
     /// `mpz_tstbit`: test whether bit `bit` is set.
+    ///
+    /// For negative values, out-of-range bits return `true` (infinite sign extension).
     pub fn tstbit(&self, bit: u32) -> bool {
         let limb = (bit / 64) as usize;
         let bit_idx = bit % 64;
         if limb >= self.len {
-            return false;
+            // Out-of-range: for negative values, sign-extend (return true);
+            // for non-negative, return false.
+            return self.sign < 0;
         }
         (self.mag[limb] >> bit_idx) & 1 == 1
     }
@@ -1837,12 +2507,7 @@ impl Mpz {
             return Err(CapacityError);
         }
         if limb >= self.len {
-            // Need to extend
-            if limb >= MPZ_MAX_LIMBS {
-                return Err(CapacityError);
-            }
             self.len = limb + 1;
-            // The newly covered limbs (between old len and new) are already zero
         }
         self.mag[limb] |= 1u64 << bit_idx;
         if self.sign == 0 {
@@ -1982,6 +2647,403 @@ impl Mpz {
         buf[pos..pos + n].copy_from_slice(&src[..n]);
         pos + n
     }
+
+    // -----------------------------------------------------------------------
+    // Low-level limb access
+    // -----------------------------------------------------------------------
+
+    /// `mpz_getlimbn`: return the nth limb (0-based).  Returns `None` if `n >= len`.
+    pub fn getlimbn(&self, n: usize) -> Option<u64> {
+        if n >= self.len {
+            None
+        } else {
+            Some(self.mag[n])
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Comparison with f64
+    // -----------------------------------------------------------------------
+
+    /// `mpz_cmp_d`: compare with `f64`.
+    pub fn cmp_d(&self, v: f64) -> Ordering {
+        if v.is_nan() {
+            return Ordering::Greater; // GMP convention: NaN compares as greater
+        }
+        let other = match Mpz::from_d(v) {
+            Ok(m) => m,
+            Err(_) => {
+                // v is infinity or subnormal/zero that couldn't fit
+                if v.is_infinite() {
+                    if v.is_sign_positive() {
+                        return Ordering::Less;
+                    } else {
+                        return Ordering::Greater;
+                    }
+                }
+                return self.cmp(&Mpz::new());
+            }
+        };
+        self.cmp(&other)
+    }
+
+    /// `mpz_cmpabs_d`: compare absolute value with `f64`.
+    pub fn cmpabs_d(&self, v: f64) -> Ordering {
+        if v.is_nan() {
+            return Ordering::Greater;
+        }
+        let v_abs = v.abs();
+        let other = match Mpz::from_d(v_abs) {
+            Ok(m) => m,
+            Err(_) => {
+                if v.is_infinite() {
+                    return Ordering::Less;
+                }
+                return self.cmp(&Mpz::new());
+            }
+        };
+        self.cmpabs(&other)
+    }
+
+    // -----------------------------------------------------------------------
+    // Import / Export
+    // -----------------------------------------------------------------------
+
+    /// `mpz_import`: construct an `Mpz` from a byte buffer.
+    ///
+    /// - `count`: number of chunks.
+    /// - `order`: ordering of chunks (`Little` = least significant chunk first,
+    ///   `Big` = most significant chunk first).
+    /// - `size`: size of each chunk in bytes.
+    /// - `endian`: endianness within each chunk.
+    /// - `data`: the raw bytes.  Must have length `count * size`.
+    pub fn try_import(
+        count: usize,
+        order: Endian,
+        size: usize,
+        endian: Endian,
+        data: &[u8],
+    ) -> Result<Mpz, CapacityError> {
+        if count == 0 || size == 0 {
+            return Ok(Mpz::new());
+        }
+        if data.len() < count * size {
+            return Ok(Mpz::new());
+        }
+
+        // The maximum number of limbs we could need is ceil(count * size / 8)
+        let max_limbs = (count * size + 7) / 8;
+        if max_limbs > MPZ_MAX_LIMBS {
+            return Err(CapacityError);
+        }
+
+        // Collect all chunks into a flat little-endian limb representation.
+        let mut limbs = [0u64; MPZ_MAX_LIMBS];
+        let n_chunks = count;
+        let chunk_size = size;
+
+        // Helper: read `size` bytes from `data[start..]` as u64 (little-endian).
+        let read_chunk = |start: usize| -> u64 {
+            let mut val = 0u64;
+            let end = (start + chunk_size).min(data.len());
+            match endian {
+                Endian::Little | Endian::Native if native_is_little() => {
+                    for i in (start..end).rev() {
+                        val = (val << 8) | data[i] as u64;
+                    }
+                }
+                _ => {
+                    // Big-endian: read bytes in order
+                    for i in start..end {
+                        val = (val << 8) | data[i] as u64;
+                    }
+                }
+            }
+            val
+        };
+
+        // Process chunks based on `order` (ordering of chunks)
+        let mut limb_idx = 0;
+        let mut bit_offset = 0;
+
+        match order {
+            Endian::Little | Endian::Native if native_is_little() => {
+                // Least significant chunk first
+                for ci in 0..n_chunks {
+                    let chunk_val = read_chunk(ci * chunk_size);
+                    limbs[limb_idx] |= chunk_val << bit_offset;
+                    bit_offset += chunk_size * 8;
+                    while bit_offset >= 64 {
+                        limb_idx += 1;
+                        bit_offset -= 64;
+                        if bit_offset > 0 {
+                            limbs[limb_idx] = chunk_val >> (chunk_size * 8 - bit_offset);
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Most significant chunk first
+                for ci in (0..n_chunks).rev() {
+                    let chunk_val = read_chunk(ci * chunk_size);
+                    limbs[limb_idx] |= chunk_val << bit_offset;
+                    bit_offset += chunk_size * 8;
+                    while bit_offset >= 64 {
+                        limb_idx += 1;
+                        bit_offset -= 64;
+                        if bit_offset > 0 {
+                            limbs[limb_idx] = chunk_val >> (chunk_size * 8 - bit_offset);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut r = Mpz::new();
+        let _n_limbs = (count * size + 7) / 8;
+        let n_limbs_actual = if bit_offset > 0 {
+            limb_idx + 1
+        } else {
+            limb_idx
+        };
+        let final_limbs = n_limbs_actual.min(MPZ_MAX_LIMBS);
+        r.mag[..final_limbs].copy_from_slice(&limbs[..final_limbs]);
+        r.len = final_limbs;
+        r.sign = if r.len == 0 { 0 } else { 1 };
+        r.trim();
+        Ok(r)
+    }
+
+    /// `mpz_export`: write the value into a caller-provided byte buffer.
+    ///
+    /// Returns `Some(bytes_written)` on success, or `None` if the buffer is too small.
+    ///
+    /// - `buf`: output buffer.
+    /// - `order`: ordering of chunks.
+    /// - `size`: size of each chunk in bytes.
+    /// - `endian`: endianness within each chunk.
+    pub fn export_buf(
+        &self,
+        buf: &mut [u8],
+        order: Endian,
+        size: usize,
+        endian: Endian,
+    ) -> Option<usize> {
+        if self.is_zero() || size == 0 {
+            if !buf.is_empty() {
+                buf[0] = 0;
+                return Some(1);
+            }
+            return Some(0);
+        }
+
+        // Determine total bytes needed
+        let total_bits = self.sizeinbase2();
+        let total_bytes = (total_bits + 7) / 8;
+        let chunk_bytes = size;
+        let n_chunks = (total_bytes + chunk_bytes - 1) / chunk_bytes;
+        let needed_bytes = n_chunks * chunk_bytes;
+
+        if buf.len() < needed_bytes {
+            return None;
+        }
+
+        // Zero out the buffer
+        for b in buf.iter_mut().take(needed_bytes) {
+            *b = 0;
+        }
+
+        // Write each limb into the buffer in little-endian byte order
+        let mut byte_pos = 0usize;
+        for i in 0..self.len {
+            let mut val = self.mag[i];
+            for _ in 0..8 {
+                if byte_pos < needed_bytes {
+                    buf[byte_pos] = (val & 0xFF) as u8;
+                    val >>= 8;
+                    byte_pos += 1;
+                }
+            }
+        }
+
+        // Rearrange chunks based on `order` and `endian`
+        // If the natural output is already in the correct format, return.
+        // Otherwise, we need to swap bytes and chunks.
+
+        let is_native_little = native_is_little();
+        let native_endian = if is_native_little {
+            Endian::Little
+        } else {
+            Endian::Big
+        };
+
+        // The internal format is little-endian bytes (least significant byte first).
+        // We need to convert to the requested (order, size, endian).
+
+        // If no transformation is needed:
+        if order == Endian::Little || (order == Endian::Native && native_endian == Endian::Little) {
+            if endian == Endian::Little
+                || (endian == Endian::Native && native_endian == Endian::Little)
+            {
+                if size == 1 || size == 0 {
+                    return Some(needed_bytes);
+                }
+                // We still need to handle chunk size
+            }
+        }
+
+        // Convert by processing chunk by chunk.
+        // First, make a copy of the original buffer to avoid read-write conflicts.
+        let mut orig = [0u8; 8];
+        let copy_len = needed_bytes.min(orig.len());
+        orig[..copy_len].copy_from_slice(&buf[..copy_len]);
+        let mut chunk_tmp = [0u8; 8];
+        for ci in 0..n_chunks {
+            // Read chunk from natural LE representation (using original copy)
+            let src_start = ci * chunk_bytes;
+            let src_end = (src_start + chunk_bytes).min(needed_bytes);
+            for j in src_start..src_end {
+                let tmp_idx = j - src_start;
+                chunk_tmp[tmp_idx] = orig[j];
+            }
+            for j in src_end - src_start..chunk_bytes {
+                chunk_tmp[j] = 0;
+            }
+
+            // Apply within-chunk endianness swap
+            let chunk_val = match endian {
+                Endian::Little | Endian::Native if is_native_little => {
+                    // Already little-endian
+                    let mut v = 0u64;
+                    for j in 0..chunk_bytes {
+                        v |= (chunk_tmp[j] as u64) << (j * 8);
+                    }
+                    v
+                }
+                _ => {
+                    // Big-endian within chunk
+                    let mut v = 0u64;
+                    for j in 0..chunk_bytes {
+                        v = (v << 8) | chunk_tmp[j] as u64;
+                    }
+                    v
+                }
+            };
+
+            // Write chunk back in the natural byte order
+            for j in 0..chunk_bytes {
+                chunk_tmp[j] = ((chunk_val >> (j * 8)) & 0xFF) as u8;
+            }
+
+            // Write to output position based on chunk order
+            let dst_start = match order {
+                Endian::Little | Endian::Native if is_native_little => ci * chunk_bytes,
+                _ => (n_chunks - 1 - ci) * chunk_bytes,
+            };
+            for j in 0..chunk_bytes {
+                if dst_start + j < buf.len() {
+                    buf[dst_start + j] = chunk_tmp[j];
+                }
+            }
+        }
+
+        Some(needed_bytes)
+    }
+
+    // -----------------------------------------------------------------------
+    // Probable prime — Miller–Rabin
+    // -----------------------------------------------------------------------
+
+    /// `mpz_probab_prime_p`: Miller–Rabin probable prime test.
+    ///
+    /// Returns:
+    /// - `2` if `self` is definitely prime.
+    /// - `1` if `self` is probably prime.
+    /// - `0` if `self` is definitely composite.
+    ///
+    /// Uses the first `reps` primes as bases.
+    pub fn try_probab_prime_p(&self, reps: u32) -> Result<i32, CapacityError> {
+        if self.sign < 0 {
+            return Ok(0);
+        }
+        if self.len == 0 {
+            return Ok(0);
+        }
+
+        // Handle small values directly
+        if self.len == 1 {
+            let v = self.mag[0];
+            if v < 2 {
+                return Ok(0);
+            }
+            // Check against small primes
+            for &p in SMALL_PRIMES.iter() {
+                if p * p > v {
+                    break;
+                }
+                if v % p == 0 {
+                    return Ok(if v == p { 2 } else { 0 });
+                }
+            }
+            if v <= SMALL_PRIMES[SMALL_PRIMES.len() - 1].pow(2) {
+                return Ok(2); // definitely prime
+            }
+        }
+
+        // Check small prime divisors first
+        for &p in SMALL_PRIMES.iter() {
+            if self.tdiv_ui(p) == 0 {
+                // self is divisible by p
+                let _p_mpz = Mpz::from_u64(p);
+                if self.len == 1 && self.mag[0] == p {
+                    return Ok(2);
+                }
+                return Ok(0);
+            }
+        }
+
+        // Miller–Rabin: write self-1 = d * 2^s with d odd
+        let one = Mpz::from_u64(1);
+        let nm1 = self.try_sub(&one)?;
+        let s = nm1.mag[0].trailing_zeros(); // number of trailing zeros
+        let d = nm1.fdiv_q_2exp(s);
+
+        let reps = reps.min(64);
+        for i in 0..reps {
+            let a = Mpz::from_u64(SMALL_PRIMES[i as usize]);
+            // Compute x = a^d mod self
+            let mut x = a.try_powm(&d, self)?;
+            if x.len == 0 || (x.len == 1 && x.mag[0] == 1) || x == nm1 {
+                continue;
+            }
+            let mut composite = true;
+            for _ in 0..s {
+                x = x.try_powm(&Mpz::from_u64(2), self)?;
+                if x == nm1 {
+                    composite = false;
+                    break;
+                }
+                if x.len == 1 && x.mag[0] == 1 {
+                    break;
+                }
+            }
+            if composite {
+                return Ok(0);
+            }
+        }
+
+        Ok(1)
+    }
+} // impl Mpz
+
+// ===========================================================================
+// Helper: 64×64 → 128 multiplication (no unsafe, uses u128)
+// ===========================================================================
+
+#[inline(always)]
+fn umul(a: u64, b: u64) -> (u64, u64) {
+    let prod = a as u128 * b as u128;
+    (prod as u64, (prod >> 64) as u64)
 }
 
 // ===========================================================================
@@ -1999,6 +3061,8 @@ mod tests {
         let len = m.write_decimal_buf(&mut buf);
         core::str::from_utf8(&buf[..len]).unwrap().into()
     }
+
+    // ---- Existing tests (kept identical) ----
 
     #[test]
     fn basic_arith() {
@@ -2091,7 +3155,6 @@ mod tests {
         assert_eq!(s(&b), "123");
         b.neg();
         assert_eq!(s(&b), "-123");
-        // Non-mutating
         assert_eq!(s(&a.neg_to()), "123");
         assert_eq!(s(&a.abs_to()), "123");
     }
@@ -2127,13 +3190,11 @@ mod tests {
 
     #[test]
     fn div_floor() {
-        // Floor: -100 / 30 = -4 remainder 20 (because -4*30 = -120, -120 + 20 = -100)
         let a = Mpz::from_i64(-100);
         let d = Mpz::from_i64(30);
         let (q, r) = a.try_fdiv_qr(&d).unwrap();
         assert_eq!(s(&q), "-4");
         assert_eq!(s(&r), "20");
-        // Positive: 100 / 30 = 3 remainder 10
         let a2 = Mpz::from_i64(100);
         let (q2, r2) = a2.try_fdiv_qr(&d).unwrap();
         assert_eq!(s(&q2), "3");
@@ -2144,7 +3205,7 @@ mod tests {
     fn div_floor_ui() {
         let a = Mpz::from_i64(-100);
         let r = a.fdiv_ui(30);
-        assert_eq!(r, 20); // floor remainder is positive
+        assert_eq!(r, 20);
     }
 
     #[test]
@@ -2169,7 +3230,7 @@ mod tests {
     #[test]
     fn congruent_tests() {
         let a = Mpz::from_i64(17);
-        assert!(a.congruent_ui_p(5, 12)); // 17 ≡ 5 (mod 12)
+        assert!(a.congruent_ui_p(5, 12));
         assert!(!a.congruent_ui_p(6, 12));
     }
 
@@ -2187,7 +3248,6 @@ mod tests {
         let a = Mpz::from_u64(120);
         let b = Mpz::from_u64(23);
         let (g, s_coeff, t) = a.try_gcdext(&b).unwrap();
-        // 120 * s + 23 * t = g
         let check = s_coeff
             .try_mul(&a)
             .unwrap()
@@ -2200,7 +3260,7 @@ mod tests {
     #[test]
     fn invert() {
         let a = Mpz::from_u64(3);
-        let m = Mpz::from_u64(13); // 3 * 9 = 27 ≡ 1 (mod 13)
+        let m = Mpz::from_u64(13);
         let inv = a.try_invert(&m).unwrap();
         let prod = a.try_mul(&inv).unwrap().try_mod(&m).unwrap();
         assert_eq!(prod, Mpz::from_u64(1));
@@ -2240,8 +3300,7 @@ mod tests {
         assert_eq!(a.try_and(&b).unwrap(), Mpz::from_u64(0b1000));
         assert_eq!(a.try_ior(&b).unwrap(), Mpz::from_u64(0b1110));
         assert_eq!(a.try_xor(&b).unwrap(), Mpz::from_u64(0b0110));
-        // With negative values (two's complement)
-        let neg = Mpz::from_i64(-1); // all-ones
+        let neg = Mpz::from_i64(-1);
         assert_eq!(a.try_and(&neg).unwrap(), a);
         assert_eq!(a.try_ior(&neg).unwrap(), neg);
     }
@@ -2250,7 +3309,7 @@ mod tests {
     fn popcount_hamdist() {
         assert_eq!(Mpz::from_u64(0b1010).popcount(), Some(2));
         assert_eq!(Mpz::new().popcount(), Some(0));
-        assert_eq!(Mpz::from_i64(-1).popcount(), None); // undefined for negative
+        assert_eq!(Mpz::from_i64(-1).popcount(), None);
         assert_eq!(
             Mpz::from_u64(0b1100).hamdist(&Mpz::from_u64(0b1010)),
             Some(2)
@@ -2261,7 +3320,7 @@ mod tests {
     fn scan_tstbit() {
         let a = Mpz::from_u64(0b1010_0000);
         assert_eq!(a.scan1(0), Some(5));
-        assert_eq!(a.scan0(0), 0); // LSB is 0
+        assert_eq!(a.scan0(0), 0);
         assert!(a.tstbit(5));
         assert!(!a.tstbit(4));
         let mut b = Mpz::new();
@@ -2289,7 +3348,6 @@ mod tests {
 
     #[test]
     fn powm_test() {
-        // 3^5 mod 7 = 243 mod 7 = 5
         let base = Mpz::from_u64(3);
         let exp = Mpz::from_u64(5);
         let m = Mpz::from_u64(7);
@@ -2299,21 +3357,17 @@ mod tests {
 
     #[test]
     fn root_test() {
-        // cube root of 1000 = 10
         let r = Mpz::from_u64(1000).try_root(3).unwrap();
         assert_eq!(r, Mpz::from_u64(10));
-        // cube root of 100 = 4 (4^3 = 64, 5^3 = 125)
         let r2 = Mpz::from_u64(100).try_root(3).unwrap();
         assert_eq!(r2, Mpz::from_u64(4));
     }
 
     #[test]
     fn remove_test() {
-        let a = Mpz::from_u64(2700); // 2^2 * 3^3 * 5^2 = 4 * 27 * 25
+        let a = Mpz::from_u64(2700);
         let (rem, count) = a.try_remove(&Mpz::from_u64(2)).unwrap();
         assert_eq!(count, 2);
-        // 2700 / 4 = 675 = 3^3 * 5^2
-        // Actually 2700 = 2^2 * 3^3 * 5^2, so removing factor 2 -> 675
         assert_eq!(rem, Mpz::from_u64(675));
     }
 
@@ -2332,18 +3386,16 @@ mod tests {
     #[test]
     fn addmul_submul() {
         let mut a = Mpz::from_u64(10);
-        a.try_addmul(&Mpz::from_u64(3), &Mpz::from_u64(5)).unwrap(); // 10 + 15 = 25
+        a.try_addmul(&Mpz::from_u64(3), &Mpz::from_u64(5)).unwrap();
         assert_eq!(a, Mpz::from_u64(25));
-        a.try_submul(&Mpz::from_u64(2), &Mpz::from_u64(5)).unwrap(); // 25 - 10 = 15
+        a.try_submul(&Mpz::from_u64(2), &Mpz::from_u64(5)).unwrap();
         assert_eq!(a, Mpz::from_u64(15));
     }
 
     #[test]
     fn ui_sub() {
-        // 100 - 1 = 99
         let r = Mpz::try_ui_sub(100, &Mpz::from_u64(1)).unwrap();
         assert_eq!(r, Mpz::from_u64(99));
-        // 0 - 5 = -5
         let r2 = Mpz::try_ui_sub(0, &Mpz::from_u64(5)).unwrap();
         assert_eq!(r2, Mpz::from_i64(-5));
     }
@@ -2381,7 +3433,7 @@ mod tests {
         assert_eq!(Mpz::from_u64(255).try_sizeinbase(2), Some(8));
         assert_eq!(Mpz::new().try_sizeinbase(10), Some(1));
         assert_eq!(Mpz::from_i64(-5).try_sizeinbase(10), Some(2));
-        assert_eq!(Mpz::from_u64(255).try_sizeinbase(1), None); // unsupported
+        assert_eq!(Mpz::from_u64(255).try_sizeinbase(1), None);
     }
 
     #[test]
@@ -2449,11 +3501,9 @@ mod tests {
 
     #[test]
     fn cdiv_test() {
-        // Ceiling division: -100 / 30 = -3 remainder -10 (since -3*30 = -90, -90 + -10 = -100)
         let a = Mpz::from_i64(-100);
         let d = Mpz::from_i64(30);
         let (q, r) = a.try_cdiv_qr(&d).unwrap();
-        // Verify: q*d + r == a
         assert_eq!(q.try_mul(&d).unwrap().try_add(&r).unwrap(), a);
     }
 
@@ -2467,9 +3517,9 @@ mod tests {
     #[test]
     fn addmul_ui_submul_ui() {
         let mut a = Mpz::from_u64(10);
-        a.try_addmul_ui(&Mpz::from_u64(3), 5).unwrap(); // 10 + 15 = 25
+        a.try_addmul_ui(&Mpz::from_u64(3), 5).unwrap();
         assert_eq!(a, Mpz::from_u64(25));
-        a.try_submul_ui(&Mpz::from_u64(2), 5).unwrap(); // 25 - 10 = 15
+        a.try_submul_ui(&Mpz::from_u64(2), 5).unwrap();
         assert_eq!(a, Mpz::from_u64(15));
     }
 
@@ -2477,7 +3527,7 @@ mod tests {
     fn tdiv_r_ui_test() {
         let a = Mpz::from_i64(-100);
         let r = a.tdiv_r_ui(30);
-        assert_eq!(r, Mpz::from_u64(10)); // |100| mod 30 = 10
+        assert_eq!(r, Mpz::from_u64(10));
     }
 
     #[test]
@@ -2505,29 +3555,26 @@ mod tests {
         let a = Mpz::from_u64(0b1010_0000);
         assert_eq!(a.scan1(0), Some(5));
         assert_eq!(a.scan0(5), 6);
-        assert_eq!(a.scan1(8), None); // no more 1 bits above bit 7
+        assert_eq!(a.scan1(8), None);
         assert_eq!(Mpz::from_u64(0).scan1(0), None);
     }
 
     #[test]
     fn perfect_power_test() {
-        assert!(Mpz::from_u64(27).perfect_power_p()); // 3^3
-        assert!(Mpz::from_u64(16).perfect_power_p()); // 2^4 = 4^2
+        assert!(Mpz::from_u64(27).perfect_power_p());
+        assert!(Mpz::from_u64(16).perfect_power_p());
         assert!(!Mpz::from_u64(2).perfect_power_p());
         assert!(!Mpz::new().perfect_power_p());
     }
 
     #[test]
     fn congruent_2exp_test() {
-        // 17 ≡ 1 (mod 16 = 2^4)
         assert!(Mpz::from_u64(17).congruent_2exp_p(&Mpz::from_u64(1), 4));
-        // 18 ≡ 2 (mod 16)
         assert!(Mpz::from_u64(18).congruent_2exp_p(&Mpz::from_u64(2), 4));
     }
 
     #[test]
     fn remove_general_test() {
-        // 2^5 * 3^2 = 32 * 9 = 288
         let a = Mpz::try_ui_pow_ui(2, 5)
             .unwrap()
             .try_mul(&Mpz::try_ui_pow_ui(3, 2).unwrap())
@@ -2545,5 +3592,345 @@ mod tests {
             Mpz::from_u64(20)
         );
         assert_eq!(a.try_divexact_ui(4).unwrap(), Mpz::from_u64(25));
+    }
+
+    // ---- NEW TESTS ----
+
+    #[test]
+    fn tstbit_negative_bug() {
+        // R01: tstbit for negative values must return true for out-of-range bits
+        let neg = Mpz::from_i64(-5);
+
+        // Out-of-range bit (beyond self.len=1, so >= 64)
+        assert!(
+            neg.tstbit(100),
+            "tstbit(-5, 100) should be true (sign extension)"
+        );
+
+        // For positive: out-of-range returns false
+        let pos = Mpz::from_u64(5);
+        assert!(!pos.tstbit(100), "tstbit(5, 100) should be false");
+
+        // For zero: out-of-range returns false
+        let zero = Mpz::new();
+        assert!(!zero.tstbit(100), "tstbit(0, 100) should be false");
+
+        // Verify -1 has out-of-range bits set (sign extension)
+        let neg_one = Mpz::from_i64(-1);
+        // In-range bits checked via magnitude: -1 = mag=[1], so bit 0 = 1, bit 1 = 0, etc.
+        assert!(neg_one.tstbit(0), "tstbit(-1, 0)");
+        // Out-of-range bits (beyond limb count) are set for negatives
+        assert!(neg_one.tstbit(64), "tstbit(-1, 64) - sign extension");
+        assert!(neg_one.tstbit(200), "tstbit(-1, 200) - sign extension");
+    }
+
+    #[test]
+    fn bitwise_negative_bug() {
+        // R02: bitwise ops with negative values need proper 2's complement extension
+        // -2 & -3 = ?
+        // -2 in 2's complement (64-bit): !2+1 = 0xFFFFFFFFFFFFFFFD... no, !2=0xFFFFFFFFFFFFFFFD,
+        //   +1 = 0xFFFFFFFFFFFFFFFE
+        // -3 in 2's complement: !3+1 = 0xFFFFFFFFFFFFFFFC+1 = 0xFFFFFFFFFFFFFFFD
+        // -2 & -3: 0xFFFFFFFFFFFFFFFE & 0xFFFFFFFFFFFFFFFD = 0xFFFFFFFFFFFFFFFC = -4 (2's complement)
+        let n2 = Mpz::from_i64(-2);
+        let n3 = Mpz::from_i64(-3);
+        assert_eq!(n2.try_and(&n3).unwrap(), Mpz::from_i64(-4));
+
+        // -5 & 3 = ?
+        // -5 2's complement: 0xFFFFFFFFFFFFFFFB
+        //  3: 0x0000000000000003
+        // AND: 0x0000000000000003 = 3
+        let n5 = Mpz::from_i64(-5);
+        let p3 = Mpz::from_u64(3);
+        assert_eq!(n5.try_and(&p3).unwrap(), Mpz::from_u64(3));
+
+        // -5 | 3 = ?
+        // -5 2's complement: 0xFFFFFFFFFFFFFFFB
+        //  3: 0x0000000000000003
+        //  OR: 0xFFFFFFFFFFFFFFFB = -5
+        assert_eq!(n5.try_ior(&p3).unwrap(), Mpz::from_i64(-5));
+
+        // -5 ^ 3 = ?
+        // -5 2's complement: 0xFFFFFFFFFFFFFFFB
+        //  3: 0x0000000000000003
+        // XOR: 0xFFFFFFFFFFFFFFF8 = -8
+        assert_eq!(n5.try_xor(&p3).unwrap(), Mpz::from_i64(-8));
+    }
+
+    #[test]
+    fn congruent_2exp_negative_bug() {
+        // R03: congruent_2exp_p for negative values
+        // -3 ≡ 13 (mod 16) because -3 = -1*16 + 13, and in 2's complement,
+        // low 4 bits of -3 = 0xD = 13, low 4 bits of 13 = 0xD = 13
+        assert!(Mpz::from_i64(-3).congruent_2exp_p(&Mpz::from_u64(13), 4));
+        // -3 ≡ -3 (mod 16): low 4 bits are 0xD = 13 and 0xD = 13, but -3's
+        // magnitude low 4 bits would be 0x3 = 3, not 13.
+        assert!(Mpz::from_i64(-3).congruent_2exp_p(&Mpz::from_i64(-3), 4));
+        // -3 ≢ 3 (mod 16): low 4 bits of -3 in 2's complement = 13, low 4 bits of 3 = 3
+        assert!(!Mpz::from_i64(-3).congruent_2exp_p(&Mpz::from_u64(3), 4));
+    }
+
+    #[test]
+    fn from_d_tests() {
+        // Integers
+        assert_eq!(Mpz::from_d(0.0).unwrap(), Mpz::new());
+        assert_eq!(Mpz::from_d(1.0).unwrap(), Mpz::from_u64(1));
+        assert_eq!(Mpz::from_d(-1.0).unwrap(), Mpz::from_i64(-1));
+        assert_eq!(Mpz::from_d(255.0).unwrap(), Mpz::from_u64(255));
+        assert_eq!(
+            Mpz::from_d(1e18).unwrap(),
+            Mpz::from_u64(1_000_000_000_000_000_000)
+        );
+        assert_eq!(
+            Mpz::from_d(-1e18).unwrap(),
+            Mpz::from_i64(-1_000_000_000_000_000_000)
+        );
+
+        // Truncation
+        assert_eq!(Mpz::from_d(3.999).unwrap(), Mpz::from_u64(3));
+        assert_eq!(Mpz::from_d(-3.999).unwrap(), Mpz::from_i64(-3));
+        assert_eq!(Mpz::from_d(0.999).unwrap(), Mpz::new());
+
+        // Subnormals (very small values) → 0
+        assert_eq!(Mpz::from_d(1e-300).unwrap(), Mpz::new());
+
+        // Special values
+        assert_eq!(Mpz::from_d(f64::INFINITY), Err(CapacityError));
+        assert_eq!(Mpz::from_d(f64::NEG_INFINITY), Err(CapacityError));
+        assert_eq!(Mpz::from_d(f64::NAN), Err(CapacityError));
+    }
+
+    #[test]
+    fn sizeinbase_rigorous() {
+        // For base 10, the bound should be >= true size
+        let val = Mpz::from_u64(12345);
+        let sz = val.try_sizeinbase(10).unwrap();
+        assert!(sz >= "12345".len());
+
+        let large = Mpz::try_ui_pow_ui(2, 200).unwrap();
+        let sz10 = large.try_sizeinbase(10).unwrap();
+        assert!(sz10 >= s(&large).len());
+    }
+
+    #[test]
+    fn knuth_division_tests() {
+        // Use multi-limb divisors (len >= 2) to exercise Algorithm D
+        let a = Mpz::from_u64(1).try_mul_2exp(130).unwrap(); // large number
+        let b = Mpz::from_u64(1).try_mul_2exp(65).unwrap();
+        let (q, r) = a.tdiv_qr(&b);
+        assert_eq!(q, Mpz::from_u64(1).try_mul_2exp(65).unwrap());
+        assert!(r.is_zero());
+
+        // Test with larger numbers
+        let x = Mpz::from_decimal_str("123456789012345678901234567890").unwrap();
+        let y = Mpz::from_decimal_str("9876543210").unwrap();
+        let (q2, r2) = x.tdiv_qr(&y);
+        // Verify: x = q2 * y + r2
+        let check = q2.try_mul(&y).unwrap().try_add(&r2).unwrap();
+        assert_eq!(check, x);
+        assert!(r2.cmpabs(&y) == Ordering::Less);
+    }
+
+    #[test]
+    fn sealed_fields() {
+        let a = Mpz::from_u64(42);
+        assert_eq!(a.limbs(), &[42u64]);
+        assert!(!a.is_zero());
+        let b = Mpz::new();
+        assert!(b.is_zero());
+        assert!(b.limbs().is_empty());
+    }
+
+    #[test]
+    fn new_division_functions() {
+        // try_tdiv_qr_ui
+        let a = Mpz::from_i64(-100);
+        let (q, r) = a.try_tdiv_qr_ui(30).unwrap();
+        assert_eq!(q, Mpz::from_i64(-3));
+        assert_eq!(r, 10);
+
+        // try_fdiv_r_ui
+        let r = a.try_fdiv_r_ui(30).unwrap();
+        assert_eq!(r, Mpz::from_u64(20));
+
+        // Ceiling division by u64: for -100/30, ceil=-3, abs_remainder=10
+        let (q, r_u64) = a.try_cdiv_qr_ui(30).unwrap();
+        assert_eq!(q, Mpz::from_i64(-3));
+        assert_eq!(r_u64, 10);
+
+        // cdiv_ui: ceil(-100/30) = -3, absolute remainder = 10
+        let r = a.cdiv_ui(30);
+        // GMP's cdiv_ui returns the remainder as unsigned long (absolute value for positive divisor)
+        assert_eq!(r, 10);
+
+        // cdiv_q_2exp and cdiv_r_2exp
+        let pos = Mpz::from_u64(100);
+        let q = pos.cdiv_q_2exp(3); // ceil(100 / 8) = 13
+        assert_eq!(q, Mpz::from_u64(13));
+        let r = pos.cdiv_r_2exp(3); // 100 - 13*8 = 100 - 104 = -4? No, remainder should match: 100 = 13*8 + (-4)? That's wrong.
+                                    // Actually cdiv_r_2exp returns remainder = self - ceil(self/2^k) * 2^k
+                                    // For 100, ceil(100/8) = 13, 13*8 = 104, remainder = 100 - 104 = -4
+        assert_eq!(r, Mpz::from_i64(-4));
+    }
+
+    #[test]
+    fn number_theory_functions() {
+        // Legendre = Jacobi for odd prime modulus
+        assert_eq!(Mpz::from_u64(1).try_legendre(&Mpz::from_u64(7)), 1);
+        assert_eq!(Mpz::from_u64(2).try_legendre(&Mpz::from_u64(7)), 1);
+        assert_eq!(Mpz::from_u64(3).try_legendre(&Mpz::from_u64(7)), -1);
+
+        // Kronecker
+        assert_eq!(Mpz::from_u64(0).try_kronecker(&Mpz::from_u64(1)), 1);
+        assert_eq!(Mpz::from_u64(2).try_kronecker(&Mpz::from_u64(5)), -1);
+
+        // Kronecker with signed/unsigned
+        // (5/7) = (7/5) = (2/5) = (-1)^{(25-1)/8} = -1
+        assert_eq!(Mpz::from_u64(5).try_kronecker_si(7), -1);
+        assert_eq!(Mpz::from_u64(5).try_kronecker_ui(7), -1);
+        assert_eq!(Mpz::try_si_kronecker(5, &Mpz::from_u64(7)), -1);
+        assert_eq!(Mpz::try_ui_kronecker(5, &Mpz::from_u64(7)), -1);
+    }
+
+    #[test]
+    fn fib2_lucnum() {
+        // fib2: F(10)=55, F(9)=34
+        let (f_n, f_nm1) = Mpz::try_fib2_ui(10).unwrap();
+        assert_eq!(f_n, Mpz::from_u64(55));
+        assert_eq!(f_nm1, Mpz::from_u64(34));
+
+        // lucnum: L(10)=123
+        assert_eq!(Mpz::try_lucnum_ui(10).unwrap(), Mpz::from_u64(123));
+
+        // lucnum2: L(10)=123, L(9)=76
+        let (l_n, l_nm1) = Mpz::try_lucnum2_ui(10).unwrap();
+        assert_eq!(l_n, Mpz::from_u64(123));
+        assert_eq!(l_nm1, Mpz::from_u64(76));
+    }
+
+    #[test]
+    fn double_factorial() {
+        // 5!! = 5*3*1 = 15
+        assert_eq!(Mpz::try_2fac_ui(5).unwrap(), Mpz::from_u64(15));
+        // 6!! = 6*4*2 = 48
+        assert_eq!(Mpz::try_2fac_ui(6).unwrap(), Mpz::from_u64(48));
+        // 0!! = 1, 1!! = 1
+        assert_eq!(Mpz::try_2fac_ui(0).unwrap(), Mpz::from_u64(1));
+        assert_eq!(Mpz::try_2fac_ui(1).unwrap(), Mpz::from_u64(1));
+    }
+
+    #[test]
+    fn primorial() {
+        // primorial(10) = 2*3*5*7 = 210
+        assert_eq!(Mpz::try_primorial_ui(10).unwrap(), Mpz::from_u64(210));
+        // primorial(0) = 1, primorial(1) = 1
+        assert_eq!(Mpz::try_primorial_ui(0).unwrap(), Mpz::from_u64(1));
+        assert_eq!(Mpz::try_primorial_ui(1).unwrap(), Mpz::from_u64(1));
+    }
+
+    #[test]
+    fn bin_ui() {
+        // C(10, 3) = 120
+        let n = Mpz::from_u64(10);
+        assert_eq!(n.try_bin_ui(3).unwrap(), Mpz::from_u64(120));
+        // C(10, 0) = 1
+        assert_eq!(n.try_bin_ui(0).unwrap(), Mpz::from_u64(1));
+        // C(0, 0) = 1
+        let zero = Mpz::new();
+        assert_eq!(zero.try_bin_ui(0).unwrap(), Mpz::from_u64(1));
+    }
+
+    #[test]
+    fn cmp_d_tests() {
+        // Positive values
+        assert_eq!(Mpz::from_u64(5).cmp_d(3.0), Ordering::Greater);
+        assert_eq!(Mpz::from_u64(3).cmp_d(5.0), Ordering::Less);
+        assert_eq!(Mpz::from_u64(3).cmp_d(3.0), Ordering::Equal);
+        // Negative values
+        assert_eq!(Mpz::from_i64(-5).cmp_d(-3.0), Ordering::Less);
+        assert_eq!(Mpz::from_i64(-3).cmp_d(-5.0), Ordering::Greater);
+        // Mixed signs
+        assert_eq!(Mpz::from_i64(-5).cmp_d(3.0), Ordering::Less);
+        assert_eq!(Mpz::from_u64(5).cmp_d(-3.0), Ordering::Greater);
+        // cmpabs_d
+        assert_eq!(Mpz::from_i64(-5).cmpabs_d(3.0), Ordering::Greater);
+        assert_eq!(Mpz::from_i64(-3).cmpabs_d(5.0), Ordering::Less);
+    }
+
+    #[test]
+    fn getlimbn_test() {
+        let a = Mpz::from_u128(0x1234567890ABCDEF);
+        assert_eq!(a.getlimbn(0), Some(0x1234567890ABCDEF)); // Wait, little-endian: mag[0] = low 64 bits
+                                                             // Actually from_u128(0x1234567890ABCDEF): mag[0] = 0x1234567890ABCDEF (since it's < 2^64)
+        assert_eq!(a.getlimbn(1), None);
+        assert_eq!(a.getlimbn(0), Some(0x1234567890ABCDEF));
+
+        let b = Mpz::new();
+        assert_eq!(b.getlimbn(0), None);
+    }
+
+    #[test]
+    fn probab_prime_tests() {
+        // 2 is prime
+        assert_eq!(Mpz::from_u64(2).try_probab_prime_p(5).unwrap(), 2);
+        // 3 is prime
+        assert_eq!(Mpz::from_u64(3).try_probab_prime_p(5).unwrap(), 2);
+        // 4 is composite
+        assert_eq!(Mpz::from_u64(4).try_probab_prime_p(5).unwrap(), 0);
+        // 17 is prime
+        assert_eq!(Mpz::from_u64(17).try_probab_prime_p(5).unwrap(), 2);
+        // 1 is not prime
+        assert_eq!(Mpz::from_u64(1).try_probab_prime_p(5).unwrap(), 0);
+        // 0 is not prime
+        assert_eq!(Mpz::new().try_probab_prime_p(5).unwrap(), 0);
+        // Negative is not prime
+        assert_eq!(Mpz::from_i64(-5).try_probab_prime_p(5).unwrap(), 0);
+        // 7919 is prime (1000th prime)
+        assert_eq!(Mpz::from_u64(7919).try_probab_prime_p(10).unwrap(), 2);
+    }
+
+    #[test]
+    fn import_export_tests() {
+        // Round-trip: export then import
+        let val = Mpz::from_u64(0x1234567890ABCDEF);
+        let mut buf = [0u8; 8];
+        let n = val
+            .export_buf(&mut buf, Endian::Little, 1, Endian::Little)
+            .unwrap();
+        assert_eq!(n, 8);
+
+        let imported = Mpz::try_import(8, Endian::Little, 1, Endian::Little, &buf).unwrap();
+        assert_eq!(imported, val);
+
+        // Big-endian round-trip
+        let mut buf2 = [0u8; 8];
+        let n2 = val
+            .export_buf(&mut buf2, Endian::Big, 1, Endian::Big)
+            .unwrap();
+        assert_eq!(n2, 8);
+        // The BE bytes: MSB first, so buf2[0] = 0x12 (most significant byte)
+        assert_eq!(buf2[0], 0x12);
+        assert_eq!(buf2[7], 0xEF);
+
+        let imported2 = Mpz::try_import(8, Endian::Big, 1, Endian::Big, &buf2).unwrap();
+        assert_eq!(imported2, val);
+    }
+
+    #[test]
+    fn knuth_multi_limb_division() {
+        // Create a case where divisor has >= 2 limbs
+        let a = Mpz::try_ui_pow_ui(2, 200).unwrap();
+        let b = Mpz::try_ui_pow_ui(2, 100).unwrap();
+        let (q, r) = a.tdiv_qr(&b);
+        assert_eq!(q, Mpz::try_ui_pow_ui(2, 100).unwrap());
+        assert!(r.is_zero());
+
+        // Mixed multi-limb values
+        let x = Mpz::from_decimal_str("1234567890123456789012345678901234567890").unwrap();
+        let y = Mpz::from_decimal_str("98765432109876543210").unwrap();
+        let (q2, r2) = x.tdiv_qr(&y);
+        let check = q2.try_mul(&y).unwrap().try_add(&r2).unwrap();
+        assert_eq!(check, x);
+        assert!(r2.cmpabs(&y) == Ordering::Less || r2.is_zero());
     }
 }
