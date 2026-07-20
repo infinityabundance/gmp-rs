@@ -8,7 +8,7 @@ repository = "https://github.com/infinityabundance/gmp-rs"
 documentation = "https://docs.rs/gmp-rs"
 readme = "README.md"
 keywords = ["gmp", "bignum", "arbitrary-precision", "bigint", "no-alloc"]
-categories = ["algorithms", "data-structures", "no-std", "no-alloc", "mathematics"]
+categories = ["algorithms", "data-structures", "no-std", "mathematics"]
 
 [features]
 default = []
