@@ -1,14 +1,14 @@
 [package]
 name = "gmp-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A pure-Rust, no-unsafe, no_std arbitrary-precision integer (mpz) subset, faithful to GMP's mpz_* operations."
+description = "A pure-Rust, no-unsafe, no_std, no_alloc arbitrary-precision integer (mpz) subset, faithful to GMP's mpz_* operations."
 license = "LGPL-3.0-or-later"
 repository = "https://github.com/infinityabundance/gmp-rs"
 documentation = "https://docs.rs/gmp-rs"
 readme = "README.md"
-keywords = ["gmp", "bignum", "arbitrary-precision", "bigint", "no-std"]
-categories = ["algorithms", "data-structures", "no-std", "mathematics"]
+keywords = ["gmp", "bignum", "arbitrary-precision", "bigint", "no-std", "no-alloc"]
+categories = ["algorithms", "data-structures", "no-std", "no-alloc", "mathematics"]
 
 [features]
 default = []

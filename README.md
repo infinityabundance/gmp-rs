@@ -3,28 +3,26 @@
 [![crates.io](https://img.shields.io/crates/v/gmp-rs.svg)](https://crates.io/crates/gmp-rs)
 [![Documentation](https://docs.rs/gmp-rs/badge.svg)](https://docs.rs/gmp-rs)
 
-A **no-unsafe**, **`no_std`** pure-Rust arbitrary-precision signed integer library (`Mpz`), faithful to the
-GMP `mpz_*` operations. Built for use as the integer foundation in higher-level decimal/numeric ports.
+A **no-unsafe**, **`no_std`**, **`no_alloc`** pure-Rust arbitrary-precision signed integer library
+(`Mpz`), faithful to the GMP `mpz_*` operations.
 
-## Features
+## Guarantees
 
 - **Zero `unsafe` code** — `#![forbid(unsafe_code)]` enforced at compile time.
-- **`no_std`** — only depends on the `alloc` crate; no standard library required.
-- **Sign–magnitude representation** — little-endian base-2⁶⁴ limbs, no trailing zero limb.
-- **Arithmetic:** addition, subtraction, multiplication, truncated division, shifts, powers, integer square root.
-- **Conversions:** to/from `u64`, `i64`, `u128`, `i128`, and decimal strings.
-- **Faithful to GMP semantics** — matches the `mpz_*` surface used by GnuCOBOL's numeric port.
+- **`no_std`** — no standard library dependency.
+- **`no_alloc`** — zero heap allocations. Fixed-capacity limb storage (`[u64; 8]`, 512 bits/~154 decimal digits).
+  Operations that would exceed capacity return `Err(CapacityError)`.
 
 ## Quick start
 
 ```rust
 use gmp_rs::Mpz;
 
-let a = Mpz::from_decimal_string("123456789012345678901234567890");
-let b = Mpz::from_decimal_string("987654321098765432109876543210");
+let a = Mpz::from_decimal_str("123456789012345678901234567890").unwrap();
+let b = Mpz::from_decimal_str("987654321098765432109876543210").unwrap();
 
-let sum = &a + &b;
-let product = a.mul(&b);
+let sum = a.try_add(&b).unwrap();
+let product = a.try_mul(&b).unwrap();
 
 println!("{}", sum);       // 1111111110111111111011111111100
 println!("{}", product);   // 1219326311370217952261850327336...
