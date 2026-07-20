@@ -1,0 +1,17 @@
+[package]
+name = "gmp-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A pure-Rust, no-unsafe, no_std arbitrary-precision integer (mpz) subset, faithful to GMP's mpz_* operations."
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/infinityabundance/gmp-rs"
+documentation = "https://docs.rs/gmp-rs"
+readme = "README.md"
+keywords = ["gmp", "bignum", "arbitrary-precision", "bigint", "no-std"]
+categories = ["algorithms", "data-structures", "no-std", "mathematics"]
+
+[features]
+default = []
+
+[lints.rust]
+unsafe_code = "forbid"
