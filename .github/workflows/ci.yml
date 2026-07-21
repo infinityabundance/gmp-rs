@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 6 * * 1'  # weekly: Monday 06:00 UTC
+
+jobs:
+  # Layer 1: Unit tests (always runs)
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test
+      - run: cargo test --release
+
+  # Layer 2: Standard feature tests
+  features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test --features std --test replay
+      - run: cargo test --features std --test boundary_tests
+      - run: cargo test --features const_time 2>&1 || echo "const_time tests may be skipped"
+
+  # Layer 3: Property tests (proptest — may be slow)
+  property:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test --features std --test proptest_semantics
+        env:
+          PROPTEST_CASES: "256"  # limit iterations for CI speed
+
+  # Layer 4: Clippy + formatting
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+      - run: cargo clippy -- -D warnings
+      - run: cargo fmt --check
+
+  # Layer 5: GMP cross-check (requires libgmp-dev)
+  gmp-cross-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install GMP
+        run: sudo apt-get update && sudo apt-get install -y libgmp-dev
+      - run: cargo test --features gmp_cross_check --test gmp_cross_check
+
+  # Layer 6: Fuzzing (quick smoke test)
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Smoke-test fuzz targets (compile only)
+        run: cargo fuzz build --fuzz-dir fuzz

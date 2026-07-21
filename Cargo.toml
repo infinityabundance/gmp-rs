@@ -14,6 +14,17 @@ categories = ["algorithms", "data-structures", "no-std", "mathematics"]
 default = []
 std = []
 const_time = []
+nightly = []
+gmp_cross_check = []
 
-[lints.rust]
-unsafe_code = "forbid"
+[dev-dependencies]
+proptest = "1"
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+# Note: #![forbid(unsafe_code)] is in src/lib.rs, not here,
+# so that external test binaries can use FFI.
+
+[package.metadata.cargo-fuzz]
+target_directory = "fuzz"

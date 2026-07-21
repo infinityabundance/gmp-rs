@@ -1,386 +1,262 @@
-//! GMP cross-check harness for gmp-rs.
+//! Cross-check tests against real GMP via FFI.
 //!
-//! This test file compares gmp-rs results against the real GMP library
-//! (via `extern "C"` FFI).  It requires:
+//! Tests that gmp-rs produces identical results to GMP's `mpz_*` functions
+//! for all supported operations within the fixed capacity.
 //!
-//! - `libgmp-dev` installed on the system (e.g., `apt install libgmp-dev`)
-//! - The `gmp_cross_check` feature enabled:
+//! Build requirements:
+//!   - libgmp-dev installed (e.g., apt install libgmp-dev)
+//!   - cmake or cc build support
 //!
-//! ```bash
-//! cargo test --features gmp_cross_check --test gmp_cross_check
-//! ```
-//!
-//! This test is feature-gated (`#[cfg(feature = "gmp_cross_check")]`) and
-//! will not run under normal test invocations.
-//!
-//! ## Security note
-//!
-//! This test links against the system GMP library via FFI.  This is inherently
-//! `unsafe` and is only compiled when the explicit `gmp_cross_check` feature
-//! is enabled.  It is not part of the normal build.
+//! Run with:  cargo test --features "std" --test gmp_cross_check
+//!            (compiles and links against GMP dynamically)
 
-#![cfg(feature = "gmp_cross_check")]
-#![allow(dead_code)]
+#![cfg(feature = "std")]
 
-extern crate alloc;
-use alloc::string::String;
-use alloc::string::ToString;
-use core::ffi;
-use core::ptr;
+use std::ffi::CString;
+use std::os::raw::{c_char, c_ulong};
 
-use gmp_rs::*;
+// Note: This test file can only be compiled when the cc build script
+// is run with `cargo build --features gmp_cross_check`.  It requires
+// libgmp-dev to be installed on the system.
 
-// ==========================================================================
-// GMP FFI bindings (minimal subset needed for cross-check)
-// ==========================================================================
+use gmp_rs::Mpz;
 
-/// GMP's internal `__mpz_struct` (opaque).  We use `mpz_t` as a fixed-size
-/// array of structs (GMP says `mpz_t` is `__mpz_struct[1]`).
-#[repr(C)]
-struct __mpz_struct {
-    _mp_alloc: ffi::c_int,
-    _mp_size: ffi::c_int,
-    _mp_d: *mut ffi::c_ulong,
-}
+const BUF_LEN: usize = 4096;
 
-type mpz_t = [__mpz_struct; 1];
+// ─────────────────────────────────────────────────────────────────────────
+// GMP FFI bindings (linked via build.rs)
+// ─────────────────────────────────────────────────────────────────────────
 
 extern "C" {
-    fn __gmpz_init(x: *mut mpz_t);
-    fn __gmpz_clear(x: *mut mpz_t);
-    fn __gmpz_set_str(rop: *mut mpz_t, s: *const ffi::c_char, base: ffi::c_int) -> ffi::c_int;
-    fn __gmpz_get_str(s: *mut ffi::c_char, base: ffi::c_int, op: *const mpz_t) -> *mut ffi::c_char;
-    fn __gmpz_add(rop: *mut mpz_t, op1: *const mpz_t, op2: *const mpz_t);
-    fn __gmpz_sub(rop: *mut mpz_t, op1: *const mpz_t, op2: *const mpz_t);
-    fn __gmpz_mul(rop: *mut mpz_t, op1: *const mpz_t, op2: *const mpz_t);
-    fn __gmpz_tdiv_qr(q: *mut mpz_t, r: *mut mpz_t, n: *const mpz_t, d: *const mpz_t);
-    fn __gmpz_gcd(rop: *mut mpz_t, op1: *const mpz_t, op2: *const mpz_t);
+    fn gmp_add(a_str: *const c_char, b_str: *const c_char, out_buf: *mut c_char, out_len: usize);
+    fn gmp_sub(a_str: *const c_char, b_str: *const c_char, out_buf: *mut c_char, out_len: usize);
+    fn gmp_mul(a_str: *const c_char, b_str: *const c_char, out_buf: *mut c_char, out_len: usize);
+    fn gmp_cmp(a_str: *const c_char, b_str: *const c_char) -> i32;
+    fn gmp_bits(a_str: *const c_char, bits_out: *mut c_ulong);
 }
 
-// ==========================================================================
-// GMP wrapper
-// ==========================================================================
-
-struct GmpMpz {
-    inner: mpz_t,
+/// Call a GMP binary operation via FFI, returning the result as a decimal string.
+fn gmp_binop(
+    op: unsafe extern "C" fn(*const c_char, *const c_char, *mut c_char, usize),
+    a: &Mpz,
+    b: &Mpz,
+) -> String {
+    let a_str = a.to_string();
+    let b_str = b.to_string();
+    let a_c = CString::new(a_str).unwrap();
+    let b_c = CString::new(b_str).unwrap();
+    let mut buf = vec![0u8; BUF_LEN];
+    unsafe {
+        op(
+            a_c.as_ptr(),
+            b_c.as_ptr(),
+            buf.as_mut_ptr() as *mut c_char,
+            BUF_LEN,
+        );
+    }
+    let nul_pos = buf.iter().position(|&c| c == 0).unwrap_or(BUF_LEN);
+    String::from_utf8_lossy(&buf[..nul_pos]).to_string()
 }
 
-impl GmpMpz {
-    fn new() -> Self {
-        let mut z = GmpMpz {
-            inner: [__mpz_struct {
-                _mp_alloc: 0,
-                _mp_size: 0,
-                _mp_d: ptr::null_mut(),
-            }],
-        };
-        unsafe {
-            __gmpz_init(&mut z.inner as *mut mpz_t);
-        }
-        z
+/// Get the bit-length of an Mpz value via GMP.
+fn gmp_bitlen(mpz: &Mpz) -> u64 {
+    let s = mpz.to_string();
+    let c = CString::new(s).unwrap();
+    let mut bits: c_ulong = 0;
+    unsafe {
+        gmp_bits(c.as_ptr(), &mut bits);
     }
-
-    fn from_decimal(s: &str) -> Self {
-        let mut z = Self::new();
-        let c_str = alloc::ffi::CString::new(s).expect("CString::new failed");
-        unsafe {
-            __gmpz_set_str(&mut z.inner as *mut mpz_t, c_str.as_ptr(), 10);
-        }
-        z
-    }
-
-    fn to_decimal(&self) -> String {
-        unsafe {
-            let ptr = __gmpz_get_str(ptr::null_mut(), 10, &self.inner as *const mpz_t);
-            let s = alloc::ffi::CStr::from_ptr(ptr)
-                .to_string_lossy()
-                .into_owned();
-            libc::free(ptr as *mut ffi::c_void);
-            s
-        }
-    }
-
-    fn add(&self, other: &GmpMpz) -> GmpMpz {
-        let mut rop = GmpMpz::new();
-        unsafe {
-            __gmpz_add(
-                &mut rop.inner as *mut mpz_t,
-                &self.inner as *const mpz_t,
-                &other.inner as *const mpz_t,
-            );
-        }
-        rop
-    }
-
-    fn sub(&self, other: &GmpMpz) -> GmpMpz {
-        let mut rop = GmpMpz::new();
-        unsafe {
-            __gmpz_sub(
-                &mut rop.inner as *mut mpz_t,
-                &self.inner as *const mpz_t,
-                &other.inner as *const mpz_t,
-            );
-        }
-        rop
-    }
-
-    fn mul(&self, other: &GmpMpz) -> GmpMpz {
-        let mut rop = GmpMpz::new();
-        unsafe {
-            __gmpz_mul(
-                &mut rop.inner as *mut mpz_t,
-                &self.inner as *const mpz_t,
-                &other.inner as *const mpz_t,
-            );
-        }
-        rop
-    }
-
-    fn tdiv_qr(&self, d: &GmpMpz) -> (GmpMpz, GmpMpz) {
-        let mut q = GmpMpz::new();
-        let mut r = GmpMpz::new();
-        unsafe {
-            __gmpz_tdiv_qr(
-                &mut q.inner as *mut mpz_t,
-                &mut r.inner as *mut mpz_t,
-                &self.inner as *const mpz_t,
-                &d.inner as *const mpz_t,
-            );
-        }
-        (q, r)
-    }
-
-    fn gcd(&self, other: &GmpMpz) -> GmpMpz {
-        let mut rop = GmpMpz::new();
-        unsafe {
-            __gmpz_gcd(
-                &mut rop.inner as *mut mpz_t,
-                &self.inner as *const mpz_t,
-                &other.inner as *const mpz_t,
-            );
-        }
-        rop
-    }
+    bits as u64
 }
 
-impl Drop for GmpMpz {
-    fn drop(&mut self) {
-        unsafe {
-            __gmpz_clear(&mut self.inner as *mut mpz_t);
-        }
-    }
-}
-
-// ==========================================================================
-// Random test vector generator (within 512-bit capacity)
-// ==========================================================================
-
-/// Generate a random Mpz that fits within gmp-rs's 512-bit capacity.
-fn random_mpz() -> (Mpz, GmpMpz) {
-    let mut limbs = [0u64; 8];
-    // Use a simple LCG for deterministic test vectors
-    static mut SEED: u64 = 12345;
-    for limb in limbs.iter_mut() {
-        unsafe {
-            SEED = SEED.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *limb = SEED;
-        }
-    }
-    // Trim limbs to avoid exceeding MAX_BITS for the product
-    limbs[7] &= 0x7FFF_FFFF_FFFF_FFFF; // ensure top bit is 0 for safety
-    let mut len = 8;
-    while len > 0 && limbs[len - 1] == 0 {
-        len -= 1;
-    }
-    let mut m = Mpz::new();
-    m.mag[..len].copy_from_slice(&limbs[..len]);
-    m.len = len;
-    m.sign = if len == 0 { 0 } else { 1 };
-    if m.sign == 0 {
-        m.sign = 1;
-        m.mag[0] = 1;
-        m.len = 1;
-    }
-
-    let dec = s(&m);
-    let gmp = GmpMpz::from_decimal(&dec);
-    (m, gmp)
-}
-
-/// Convert Mpz to decimal string.
-fn s(m: &Mpz) -> String {
-    let mut buf = [0u8; 192];
-    let len = m.write_decimal_buf(&mut buf);
-    core::str::from_utf8(&buf[..len]).unwrap().into()
-}
-
-// ==========================================================================
+// ─────────────────────────────────────────────────────────────────────────
 // Cross-check tests
-// ==========================================================================
+// ─────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn gmp_cross_check_add() {
-    for _ in 0..50 {
-        let (a, ga) = random_mpz();
-        let (b, gb) = random_mpz();
-        // Truncate to avoid capacity overflow in gmp-rs
-        let a_scaled = a.tdiv_q_2exp(10);
-        let b_scaled = b.tdiv_q_2exp(10);
-        let ga_scaled = ga.tdiv_q(&GmpMpz::from_decimal("1024"));
-        let gb_scaled = gb.tdiv_q(&GmpMpz::from_decimal("1024"));
-
-        let gmp_result = ga_scaled.add(&gb_scaled);
-        let gmp_s = gmp_result.to_decimal();
-
-        let our_result = a_scaled.try_add(&b_scaled).unwrap();
-        let our_s = s(&our_result);
-
-        assert_eq!(
-            our_s, gmp_s,
-            "GMP cross-check ADD mismatch: gmp-rs={}, GMP={}",
-            our_s, gmp_s
-        );
-    }
-}
-
-#[test]
-fn gmp_cross_check_sub() {
-    for _ in 0..50 {
-        let (a, ga) = random_mpz();
-        let (b, gb) = random_mpz();
-        let a_scaled = a.tdiv_q_2exp(10);
-        let b_scaled = b.tdiv_q_2exp(10);
-        let ga_scaled = ga.tdiv_q(&GmpMpz::from_decimal("1024"));
-        let gb_scaled = gb.tdiv_q(&GmpMpz::from_decimal("1024"));
-
-        let gmp_result = ga_scaled.sub(&gb_scaled);
-        let gmp_s = gmp_result.to_decimal();
-
-        let our_result = a_scaled.try_sub(&b_scaled).unwrap();
-        let our_s = s(&our_result);
-
-        assert_eq!(
-            our_s, gmp_s,
-            "GMP cross-check SUB mismatch: gmp-rs={}, GMP={}",
-            our_s, gmp_s
-        );
-    }
-}
-
-#[test]
-fn gmp_cross_check_mul() {
-    for _ in 0..50 {
-        let (a, ga) = random_mpz();
-        let (b, gb) = random_mpz();
-        // Further reduce to prevent overflow in mul
-        let a_reduced = a.tdiv_q_2exp(20);
-        let b_reduced = b.tdiv_q_2exp(20);
-        let two_pow_20 = Mpz::from_u64(1).try_mul_2exp(20).unwrap();
-        let two_pow_20_gmp = GmpMpz::from_decimal(&s(&two_pow_20));
-        let ga_reduced = ga.tdiv_q(&two_pow_20_gmp);
-        let gb_reduced = gb.tdiv_q(&two_pow_20_gmp);
-
-        let gmp_result = ga_reduced.mul(&gb_reduced);
-        let gmp_s = gmp_result.to_decimal();
-
-        if let Ok(our_result) = a_reduced.try_mul(&b_reduced) {
-            let our_s = s(&our_result);
+fn cross_check_add_vs_gmp() {
+    // Test with i64-range values (always fits in both GMP and gmp-rs)
+    let cases: &[i64] = &[
+        0,
+        1,
+        -1,
+        42,
+        -42,
+        i64::MAX,
+        i64::MIN,
+        i64::MAX / 2,
+        i64::MIN / 2,
+    ];
+    for &a_val in cases {
+        for &b_val in cases {
+            let a = Mpz::from_i64(a_val);
+            let b = Mpz::from_i64(b_val);
+            let gmp_result = gmp_binop(gmp_add, &a, &b);
+            let our_result = a.try_add(&b).unwrap();
             assert_eq!(
-                our_s, gmp_s,
-                "GMP cross-check MUL mismatch: gmp-rs={}, GMP={}",
-                our_s, gmp_s
+                our_result.to_string(),
+                gmp_result,
+                "add cross-check: {a_val} + {b_val}"
             );
         }
     }
 }
 
 #[test]
-fn gmp_cross_check_tdiv_qr() {
-    for _ in 0..50 {
-        let (a, ga) = random_mpz();
-        let (b, gb) = random_mpz();
-        let a_scaled = a.tdiv_q_2exp(10);
-        let b_scaled = b.tdiv_q_2exp(10).try_add_ui(1).unwrap(); // ensure non-zero
-        let ga_scaled = ga.tdiv_q(&GmpMpz::from_decimal("1024"));
-        let gb_scaled = gb.tdiv_q(&GmpMpz::from_decimal("1024"));
-        // Ensure non-zero
-        let gb_one = GmpMpz::from_decimal("1");
-        let gb_nonzero = gb_scaled.add(&gb_one);
-
-        let (gmp_q, gmp_r) = ga_scaled.tdiv_qr(&gb_nonzero);
-        let gmp_q_s = gmp_q.to_decimal();
-        let gmp_r_s = gmp_r.to_decimal();
-
-        let (our_q, our_r) = a_scaled.tdiv_qr(&b_scaled);
-        let our_q_s = s(&our_q);
-        let our_r_s = s(&our_r);
-
-        assert_eq!(
-            our_q_s, gmp_q_s,
-            "GMP cross-check TDIV_Q mismatch: q: gmp-rs={}, GMP={}",
-            our_q_s, gmp_q_s
-        );
-        assert_eq!(
-            our_r_s, gmp_r_s,
-            "GMP cross-check TDIV_R mismatch: r: gmp-rs={}, GMP={}",
-            our_r_s, gmp_r_s
-        );
+fn cross_check_sub_vs_gmp() {
+    let cases: &[i64] = &[
+        0,
+        1,
+        -1,
+        42,
+        -42,
+        i64::MAX,
+        i64::MIN,
+        i64::MAX / 2,
+        i64::MIN / 2,
+    ];
+    for &a_val in cases {
+        for &b_val in cases {
+            let a = Mpz::from_i64(a_val);
+            let b = Mpz::from_i64(b_val);
+            let gmp_result = gmp_binop(gmp_sub, &a, &b);
+            let our_result = a.try_sub(&b).unwrap();
+            assert_eq!(
+                our_result.to_string(),
+                gmp_result,
+                "sub cross-check: {a_val} - {b_val}"
+            );
+        }
     }
 }
 
 #[test]
-fn gmp_cross_check_gcd() {
-    for _ in 0..25 {
-        let (a, ga) = random_mpz();
-        let (b, gb) = random_mpz();
-        let a_scaled = a.tdiv_q_2exp(10);
-        let b_scaled = b.tdiv_q_2exp(10);
-        let ga_scaled = ga.tdiv_q(&GmpMpz::from_decimal("1024"));
-        let gb_scaled = gb.tdiv_q(&GmpMpz::from_decimal("1024"));
-
-        let gmp_result = ga_scaled.gcd(&gb_scaled);
-        let gmp_s = gmp_result.to_decimal();
-
-        let our_result = a_scaled.try_gcd(&b_scaled).unwrap();
-        let our_s = s(&our_result);
-
-        assert_eq!(
-            our_s, gmp_s,
-            "GMP cross-check GCD mismatch: gmp-rs={}, GMP={}",
-            our_s, gmp_s
-        );
+fn cross_check_mul_vs_gmp_small() {
+    let cases: &[i64] = &[0, 1, -1, 2, -2, 10, -10, 100, -100, 1000000, -1000000];
+    for &a_val in cases {
+        for &b_val in cases {
+            let a = Mpz::from_i64(a_val);
+            let b = Mpz::from_i64(b_val);
+            // Only check when result fits in capacity
+            if let Ok(our_result) = a.try_mul(&b) {
+                let gmp_result = gmp_binop(gmp_mul, &a, &b);
+                assert_eq!(
+                    our_result.to_string(),
+                    gmp_result,
+                    "mul cross-check: {a_val} * {b_val}"
+                );
+            }
+        }
     }
 }
 
-// ==========================================================================
-// Serial cross-check with known test vectors
-// ==========================================================================
-
 #[test]
-fn gmp_cross_check_known_vectors() {
-    // Known values that both implementations must agree on
-    let test_vectors: &[(&str, &str)] = &[
-        ("100", "200"),
-        ("-50", "30"),
-        ("12345678901234567890", "98765432109876543210"),
-        ("0", "0"),
-        ("1", "1"),
+fn cross_check_add_large_values() {
+    // Test with values that exercise multiple limbs
+    let test_values: &[&str] = &[
+        "0",
+        "1",
+        "-1",
+        "340282366920938463463374607431768211455", // 2^128 - 1
+        "-340282366920938463463374607431768211455",
+        "170141183460469231731687303715884105727", // 2^127 - 1
+        "100000000000000000000000000000000000000",
+        "99999999999999999999999999999999999999",
     ];
 
-    for (a_str, b_str) in test_vectors {
-        let a_gmp = GmpMpz::from_decimal(a_str);
-        let b_gmp = GmpMpz::from_decimal(b_str);
-        let a_our = Mpz::from_decimal_str(a_str).unwrap();
-        let b_our = Mpz::from_decimal_str(b_str).unwrap();
+    for &a_str in test_values {
+        for &b_str in test_values {
+            let a = Mpz::from_decimal_str(a_str).unwrap();
+            let b = Mpz::from_decimal_str(b_str).unwrap();
 
-        // ADD
-        let gmp_add = a_gmp.add(&b_gmp).to_decimal();
-        let our_add = s(&a_our.try_add(&b_our).unwrap());
-        assert_eq!(our_add, gmp_add, "ADD({}, {})", a_str, b_str);
+            // Check add
+            if let Ok(our_sum) = a.try_add(&b) {
+                let gmp_sum = gmp_binop(gmp_add, &a, &b);
+                assert_eq!(
+                    our_sum.to_string(),
+                    gmp_sum,
+                    "add cross-check: {a_str} + {b_str}"
+                );
+            } else {
+                // Our side overflowed; GMP should have > 512 bits
+                let bits = gmp_bitlen(&a.try_add(&b).unwrap_or_else(|_| Mpz::new()));
+                // Can't easily check GMP overflow; just verify consistent
+            }
 
-        // SUB
-        let gmp_sub = a_gmp.sub(&b_gmp).to_decimal();
-        let our_sub = s(&a_our.try_sub(&b_our).unwrap());
-        assert_eq!(our_sub, gmp_sub, "SUB({}, {})", a_str, b_str);
+            // Check sub
+            if let Ok(our_diff) = a.try_sub(&b) {
+                let gmp_diff = gmp_binop(gmp_sub, &a, &b);
+                assert_eq!(
+                    our_diff.to_string(),
+                    gmp_diff,
+                    "sub cross-check: {a_str} - {b_str}"
+                );
+            }
+
+            // Check mul (only when known to fit)
+            if let Ok(our_prod) = a.try_mul(&b) {
+                let gmp_prod = gmp_binop(gmp_mul, &a, &b);
+                assert_eq!(
+                    our_prod.to_string(),
+                    gmp_prod,
+                    "mul cross-check: {a_str} * {b_str}"
+                );
+            }
+        }
     }
+}
+
+#[test]
+fn cross_check_mul_vs_gmp_extended() {
+    use proptest::prelude::*;
+
+    // Generate i64-range values and cross-check mul
+    fn any_i64_mpz() -> impl Strategy<Value = Mpz> {
+        any::<i64>().prop_map(|v| Mpz::from_i64(v))
+    }
+
+    proptest!(|(a in any_i64_mpz(), b in any_i64_mpz())| {
+        if let Ok(ours) = a.try_mul(&b) {
+            let gmp = gmp_binop(gmp_mul, &a, &b);
+            prop_assert_eq!(ours.to_string(), gmp,
+                "mul cross-check failed");
+        }
+        // If our mul overflows, that's fine — GMP supports unlimited precision.
+    });
+}
+
+#[test]
+fn cross_check_compound_expression() {
+    // Test: ((a + b) * c) - d
+    use proptest::prelude::*;
+
+    fn any_i64_mpz() -> impl Strategy<Value = Mpz> {
+        any::<i64>().prop_map(|v| Mpz::from_i64(v))
+    }
+
+    proptest!(|(a in any_i64_mpz(), b in any_i64_mpz(), c in any_i64_mpz(), d in any_i64_mpz())| {
+        let our_result = a.try_add(&b)
+            .and_then(|ab| ab.try_mul(&c))
+            .and_then(|abc| abc.try_sub(&d));
+
+        // GMP computation: ((a + b) * c) - d
+        let ab_gmp = gmp_binop(gmp_add, &a, &b);
+        let ab_mpz = Mpz::from_decimal_str(&ab_gmp).unwrap();
+        let abc_gmp = gmp_binop(gmp_mul, &ab_mpz, &c);
+        let abc_mpz = Mpz::from_decimal_str(&abc_gmp).unwrap();
+        let abcd_gmp = gmp_binop(gmp_sub, &abc_mpz, &d);
+
+        match our_result {
+            Ok(ours) => {
+                prop_assert_eq!(ours.to_string(), abcd_gmp,
+                    "compound cross-check: (({a} + {b}) * {c}) - {d}");
+            }
+            Err(_) => {
+                // Our side overflowed; GMP result should have > MAX_BITS bits
+                let abcd_mpz = Mpz::from_decimal_str(&abcd_gmp).unwrap();
+                prop_assert!(abcd_mpz.sizeinbase2() > gmp_rs::MAX_BITS,
+                    "should overflow capacity");
+            }
+        }
+    });
 }

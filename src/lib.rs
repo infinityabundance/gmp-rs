@@ -1200,8 +1200,8 @@ impl Mpz {
         }
         let ls = (bits / 64) as usize;
         let bs = bits % 64;
-        let needed = self.len + ls + if bs != 0 { 1 } else { 0 };
-        if needed > MPZ_MAX_LIMBS {
+        // Quick check: if the limb shift alone already exceeds capacity, fail early.
+        if ls >= MPZ_MAX_LIMBS || self.len > MPZ_MAX_LIMBS - ls {
             return Err(CapacityError);
         }
         let mut r = Mpz::new();
@@ -1212,11 +1212,17 @@ impl Mpz {
             let mut carry = 0u64;
             let mut idx = ls;
             for &l in self.mag[..self.len].iter() {
+                if idx >= MPZ_MAX_LIMBS {
+                    return Err(CapacityError);
+                }
                 r.mag[idx] = (l << bs) | carry;
                 carry = l >> (64 - bs);
                 idx += 1;
             }
             if carry != 0 {
+                if idx >= MPZ_MAX_LIMBS {
+                    return Err(CapacityError);
+                }
                 r.mag[idx] = carry;
                 r.len = idx + 1;
             } else {
