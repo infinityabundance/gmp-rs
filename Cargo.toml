@@ -7,7 +7,7 @@ license = "LGPL-3.0-or-later"
 repository = "https://github.com/infinityabundance/gmp-rs"
 documentation = "https://docs.rs/gmp-rs"
 readme = "README.md"
-keywords = ["gmp", "bignum", "arbitrary-precision", "bigint", "no-alloc"]
+keywords = ["gmp", "arbitrary-precision", "ffi", "bigint", "no-alloc"]
 categories = ["algorithms", "data-structures", "mathematics", "no-std", "science"]
 
 [features]
@@ -33,3 +33,8 @@ target_directory = "fuzz"
 [[bench]]
 name = "arithmetic"
 harness = false
+
+[[bench]]
+name = "gmp_comparison"
+harness = false
+required-features = ["gmp_cross_check"]
