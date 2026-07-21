@@ -4,7 +4,7 @@
 
 #![cfg(feature = "std")]
 
-use gmp_rs::{CapacityError, Mpz, MAX_BITS, MAX_DECIMAL_DIGITS};
+use gmp_rs::{Mpz, MAX_BITS, MAX_DECIMAL_DIGITS};
 
 // ─────────────────────────────────────────────────────────────────────────
 // Capacity boundary: 2^511 is the highest power of 2 that fits (512 bits)

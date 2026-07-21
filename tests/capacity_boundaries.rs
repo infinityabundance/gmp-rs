@@ -9,7 +9,7 @@
 //!   - Zero normalization is correct
 //!   - Sign handling is correct at the capacity extremes
 
-use gmp_rs::{CapacityError, Mpz, LIMBS, MAX_BITS};
+use gmp_rs::{Mpz, LIMBS, MAX_BITS};
 
 // ─────────────────────────────────────────────────────────────────────────
 // Helpers

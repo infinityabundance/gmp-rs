@@ -22,7 +22,7 @@ proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [build-dependencies]
-cc = { version = "1", optional = true }
+cc = "1"
 
 # Note: #![forbid(unsafe_code)] is in src/lib.rs, not here,
 # so that external test binaries can use FFI.

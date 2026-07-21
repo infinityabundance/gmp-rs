@@ -18,6 +18,7 @@ fn any_mpz_i64() -> impl Strategy<Value = Mpz> {
     any::<i64>().prop_map(|v| Mpz::from_i64(v))
 }
 
+#[allow(dead_code)]
 /// Generate an Mpz from a random i128 (always fits, up to 2 limbs).
 fn any_mpz_i128() -> impl Strategy<Value = Mpz> {
     any::<i128>().prop_map(|v| Mpz::from_i128(v))
@@ -45,6 +46,7 @@ fn any_mpz_str() -> impl Strategy<Value = String> {
         })
 }
 
+#[allow(dead_code)]
 /// Generate a random i128-sized Mpz via decimal string roundtrip.
 fn any_mpz_parseable() -> impl Strategy<Value = Mpz> {
     any_mpz_str().prop_filter_map("parseable decimal", |s| Mpz::from_decimal_str(&s).ok())
