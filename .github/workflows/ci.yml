@@ -67,7 +67,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+      - name: Install cargo-fuzz (nightly)
+        run: cargo +nightly install cargo-fuzz
       - name: Smoke-test fuzz targets (compile only)
-        run: cargo fuzz build --fuzz-dir fuzz
+        run: cargo +nightly fuzz build --fuzz-dir fuzz

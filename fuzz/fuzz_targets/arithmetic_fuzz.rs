@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-/// Fuzz arithmetic operations: feed random data into 8 limbs, run all ops.
+// Fuzz arithmetic operations.
 fuzz_target!(|data: &[u8]| {
     if data.len() < 16 {
         return;
