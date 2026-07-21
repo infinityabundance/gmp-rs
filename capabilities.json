@@ -1,0 +1,219 @@
+{
+  "crate": "gmp-rs",
+  "version": "0.3.0",
+  "constraints": {
+    "no_unsafe": true,
+    "no_std": true,
+    "no_alloc": true,
+    "max_limbs": 8,
+    "max_bits": 512,
+    "max_decimal_digits": 154
+  },
+  "capabilities": {
+    "initialization": {
+      "mpz_init": "yes — Mpz::new()",
+      "mpz_inits": "no (C varargs — not applicable)",
+      "mpz_init2": "no (preallocation not applicable to fixed arrays)",
+      "mpz_clear": "n/a (Rust Drop)",
+      "mpz_clears": "no (C varargs — not applicable)",
+      "mpz_realloc2": "no (not applicable to fixed arrays)"
+    },
+    "assignment": {
+      "mpz_set": "yes — Mpz::set()",
+      "mpz_set_ui": "yes — Mpz::set_ui()",
+      "mpz_set_si": "yes — Mpz::set_si()",
+      "mpz_set_d": "no (not implemented)",
+      "mpz_set_q": "no (requires mpq_t type)",
+      "mpz_set_f": "no (requires mpf_t type)",
+      "mpz_set_str": "partial — Mpz::from_decimal_str() (base 10 only)",
+      "mpz_swap": "yes — Mpz::swap()"
+    },
+    "combined_init_assign": {
+      "mpz_init_set": "yes — Clone::clone()",
+      "mpz_init_set_ui": "yes — Mpz::from_u64()",
+      "mpz_init_set_si": "yes — Mpz::from_i64()",
+      "mpz_init_set_d": "no (not implemented)",
+      "mpz_init_set_str": "partial — Mpz::from_decimal_str() (base 10 only)"
+    },
+    "conversion": {
+      "mpz_get_ui": "yes — Mpz::get_ui()",
+      "mpz_get_si": "yes — Mpz::get_si()",
+      "mpz_get_d": "yes — Mpz::get_d()",
+      "mpz_get_d_2exp": "yes — Mpz::get_d_2exp()",
+      "mpz_get_str": "partial — write_decimal_buf() (base 10 only)"
+    },
+    "arithmetic": {
+      "mpz_add": "yes — Mpz::try_add()",
+      "mpz_add_ui": "yes — Mpz::try_add_ui()",
+      "mpz_sub": "yes — Mpz::try_sub()",
+      "mpz_sub_ui": "yes — Mpz::try_sub_ui()",
+      "mpz_ui_sub": "yes — Mpz::try_ui_sub()",
+      "mpz_mul": "yes — Mpz::try_mul()",
+      "mpz_mul_si": "yes — Mpz::try_mul_si()",
+      "mpz_mul_ui": "yes — Mpz::try_mul_ui()",
+      "mpz_addmul": "yes — Mpz::try_addmul()",
+      "mpz_addmul_ui": "yes — Mpz::try_addmul_ui()",
+      "mpz_submul": "yes — Mpz::try_submul()",
+      "mpz_submul_ui": "yes — Mpz::try_submul_ui()",
+      "mpz_mul_2exp": "yes — Mpz::try_mul_2exp()",
+      "mpz_neg": "yes — Mpz::neg() / neg_to()",
+      "mpz_abs": "yes — Mpz::abs() / abs_to()"
+    },
+    "division_truncating": {
+      "mpz_tdiv_q": "yes — Mpz::tdiv_q()",
+      "mpz_tdiv_r": "yes — Mpz::tdiv_r()",
+      "mpz_tdiv_qr": "yes — Mpz::tdiv_qr()",
+      "mpz_tdiv_q_ui": "yes — Mpz::tdiv_q_ui()",
+      "mpz_tdiv_r_ui": "yes — Mpz::tdiv_r_ui()",
+      "mpz_tdiv_qr_ui": "yes — Mpz::try_tdiv_qr_ui()",
+      "mpz_tdiv_ui": "yes — Mpz::tdiv_ui()",
+      "mpz_tdiv_q_2exp": "yes — Mpz::tdiv_q_2exp()",
+      "mpz_tdiv_r_2exp": "yes — Mpz::tdiv_r_2exp()"
+    },
+    "division_floor": {
+      "mpz_fdiv_q": "yes — Mpz::try_fdiv_q()",
+      "mpz_fdiv_r": "yes — Mpz::try_fdiv_r()",
+      "mpz_fdiv_qr": "yes — Mpz::try_fdiv_qr()",
+      "mpz_fdiv_q_ui": "yes — Mpz::try_fdiv_q_ui()",
+      "mpz_fdiv_r_ui": "yes — Mpz::try_fdiv_r_ui()",
+      "mpz_fdiv_qr_ui": "yes — Mpz::try_fdiv_qr_ui()",
+      "mpz_fdiv_ui": "yes — Mpz::fdiv_ui()",
+      "mpz_fdiv_q_2exp": "yes — Mpz::fdiv_q_2exp()",
+      "mpz_fdiv_r_2exp": "yes — Mpz::fdiv_r_2exp()"
+    },
+    "division_ceiling": {
+      "mpz_cdiv_q": "yes — Mpz::try_cdiv_q()",
+      "mpz_cdiv_r": "yes — Mpz::try_cdiv_r()",
+      "mpz_cdiv_qr": "yes — Mpz::try_cdiv_qr()",
+      "mpz_cdiv_q_ui": "yes — Mpz::try_cdiv_q_ui()",
+      "mpz_cdiv_r_ui": "yes — Mpz::try_cdiv_r_ui()",
+      "mpz_cdiv_qr_ui": "yes — Mpz::try_cdiv_qr_ui()",
+      "mpz_cdiv_ui": "yes — Mpz::cdiv_ui()",
+      "mpz_cdiv_q_2exp": "yes — Mpz::cdiv_q_2exp()",
+      "mpz_cdiv_r_2exp": "yes — Mpz::cdiv_r_2exp()"
+    },
+    "modulo": {
+      "mpz_mod": "yes — Mpz::try_mod()",
+      "mpz_mod_ui": "yes — Mpz::mod_ui()"
+    },
+    "exact_division": {
+      "mpz_divexact": "yes — Mpz::try_divexact()",
+      "mpz_divexact_ui": "yes — Mpz::try_divexact_ui()"
+    },
+    "divisibility": {
+      "mpz_divisible_p": "yes — Mpz::divisible_p()",
+      "mpz_divisible_ui_p": "yes — Mpz::divisible_ui()",
+      "mpz_divisible_2exp_p": "yes — Mpz::divisible_2exp_p()",
+      "mpz_congruent_p": "yes — Mpz::congruent_p()",
+      "mpz_congruent_ui_p": "yes — Mpz::congruent_ui_p()",
+      "mpz_congruent_2exp_p": "yes — Mpz::congruent_2exp_p()"
+    },
+    "exponentiation": {
+      "mpz_pow_ui": "yes — Mpz::try_pow_ui()",
+      "mpz_ui_pow_ui": "yes — Mpz::try_ui_pow_ui()",
+      "mpz_powm": "yes — Mpz::try_powm()",
+      "mpz_powm_ui": "yes — Mpz::try_powm_ui()",
+      "mpz_powm_sec": "no (requires side-channel resistance beyond no_unsafe)"
+    },
+    "root_extraction": {
+      "mpz_root": "yes — Mpz::try_root()",
+      "mpz_rootrem": "yes — Mpz::try_rootrem()",
+      "mpz_sqrt": "yes — Mpz::isqrt()",
+      "mpz_sqrtrem": "yes — Mpz::try_sqrtrem()",
+      "mpz_perfect_power_p": "yes — Mpz::perfect_power_p()",
+      "mpz_perfect_square_p": "yes — Mpz::perfect_square_p()"
+    },
+    "number_theoretic": {
+      "mpz_probab_prime_p": "yes — Mpz::try_probab_prime_p()",
+      "mpz_nextprime": "no (not implemented)",
+      "mpz_prevprime": "no (not implemented)",
+      "mpz_gcd": "yes — Mpz::try_gcd()",
+      "mpz_gcd_ui": "yes — Mpz::gcd_ui()",
+      "mpz_gcdext": "yes — Mpz::try_gcdext()",
+      "mpz_lcm": "yes — Mpz::try_lcm()",
+      "mpz_lcm_ui": "yes — Mpz::try_lcm_ui()",
+      "mpz_invert": "yes — Mpz::try_invert()",
+      "mpz_jacobi": "yes — Mpz::jacobi()",
+      "mpz_legendre": "yes — Mpz::try_legendre()",
+      "mpz_kronecker": "yes — Mpz::try_kronecker()",
+      "mpz_kronecker_si": "yes — Mpz::try_kronecker_si()",
+      "mpz_kronecker_ui": "yes — Mpz::try_kronecker_ui()",
+      "mpz_si_kronecker": "yes — Mpz::try_si_kronecker()",
+      "mpz_ui_kronecker": "yes — Mpz::try_ui_kronecker()",
+      "mpz_remove": "yes — Mpz::try_remove()",
+      "mpz_fac_ui": "yes — Mpz::try_fac_ui()",
+      "mpz_2fac_ui": "yes — Mpz::try_2fac_ui()",
+      "mpz_mfac_uiui": "no (not implemented)",
+      "mpz_primorial_ui": "yes — Mpz::try_primorial_ui()",
+      "mpz_bin_ui": "yes — Mpz::try_bin_ui()",
+      "mpz_bin_uiui": "yes — Mpz::try_bin_uiui()",
+      "mpz_fib_ui": "yes — Mpz::try_fib_ui()",
+      "mpz_fib2_ui": "yes — Mpz::try_fib2_ui()",
+      "mpz_lucnum_ui": "yes — Mpz::try_lucnum_ui()",
+      "mpz_lucnum2_ui": "yes — Mpz::try_lucnum2_ui()"
+    },
+    "comparison": {
+      "mpz_cmp": "yes — Mpz::cmp()",
+      "mpz_cmp_d": "yes — Mpz::cmp_d()",
+      "mpz_cmp_si": "yes — Mpz::cmp_si()",
+      "mpz_cmp_ui": "yes — Mpz::cmp_ui()",
+      "mpz_cmpabs": "yes — Mpz::cmpabs()",
+      "mpz_cmpabs_d": "yes — Mpz::cmpabs_d()",
+      "mpz_cmpabs_ui": "yes — Mpz::cmpabs_ui()",
+      "mpz_sgn": "yes — Mpz::sgn()"
+    },
+    "logical_bit": {
+      "mpz_and": "yes — Mpz::try_and()",
+      "mpz_ior": "yes — Mpz::try_ior()",
+      "mpz_xor": "yes — Mpz::try_xor()",
+      "mpz_com": "yes — Mpz::com()",
+      "mpz_popcount": "yes — Mpz::popcount()",
+      "mpz_hamdist": "yes — Mpz::hamdist()",
+      "mpz_scan0": "yes — Mpz::scan0()",
+      "mpz_scan1": "yes — Mpz::scan1()",
+      "mpz_setbit": "yes — Mpz::try_setbit()",
+      "mpz_clrbit": "yes — Mpz::clrbit()",
+      "mpz_combit": "yes — Mpz::try_combit()",
+      "mpz_tstbit": "yes — Mpz::tstbit()"
+    },
+    "io": {
+      "mpz_out_str": "no (requires std — FILE* I/O)",
+      "mpz_inp_str": "no (requires std — FILE* I/O)",
+      "mpz_out_raw": "no (requires std — FILE* I/O)",
+      "mpz_inp_raw": "no (requires std — FILE* I/O)"
+    },
+    "random": {
+      "mpz_urandomb": "no (requires external RNG)",
+      "mpz_urandomm": "no (requires external RNG)",
+      "mpz_rrandomb": "no (requires external RNG)",
+      "mpz_random": "no (obsolete — requires RNG)",
+      "mpz_random2": "no (obsolete — requires RNG)"
+    },
+    "import_export": {
+      "mpz_import": "yes — Mpz::try_import()",
+      "mpz_export": "yes — Mpz::export_buf()"
+    },
+    "miscellaneous": {
+      "mpz_fits_ulong_p": "yes — Mpz::fits_ulong()",
+      "mpz_fits_slong_p": "yes — Mpz::fits_slong()",
+      "mpz_fits_uint_p": "yes — Mpz::fits_uint()",
+      "mpz_fits_sint_p": "yes — Mpz::fits_sint()",
+      "mpz_fits_ushort_p": "yes — Mpz::fits_ushort()",
+      "mpz_fits_sshort_p": "yes — Mpz::fits_sshort()",
+      "mpz_odd_p": "yes — Mpz::odd_p()",
+      "mpz_even_p": "yes — Mpz::even_p()",
+      "mpz_sizeinbase": "partial — Mpz::try_sizeinbase()"
+    },
+    "low_level": {
+      "mpz_size": "yes — Mpz::size()",
+      "mpz_getlimbn": "yes — Mpz::getlimbn()",
+      "mpz_limbs_read": "no (requires unsafe pointer access)",
+      "mpz_limbs_write": "no (requires unsafe pointer access)",
+      "mpz_limbs_modify": "no (requires unsafe pointer access)",
+      "mpz_limbs_finish": "no (requires unsafe pointer access)",
+      "mpz_roinit_n": "no (requires unsafe pointer tricks)",
+      "MPZ_ROINIT_N": "no (C macro — not applicable)",
+      "_mpz_realloc": "no (internal GMP function)"
+    }
+  }
+}

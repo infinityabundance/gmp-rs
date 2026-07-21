@@ -1,6 +1,6 @@
 [package]
 name = "gmp-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "A pure-Rust, no-unsafe, no_std, no_alloc arbitrary-precision integer (mpz) subset, faithful to GMP's mpz_* operations."
 license = "LGPL-3.0-or-later"
@@ -12,6 +12,8 @@ categories = ["algorithms", "data-structures", "no-std", "mathematics"]
 
 [features]
 default = []
+std = []
+const_time = []
 
 [lints.rust]
 unsafe_code = "forbid"
