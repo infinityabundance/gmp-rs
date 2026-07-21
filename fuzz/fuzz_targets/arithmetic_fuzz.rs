@@ -4,7 +4,8 @@ use libfuzzer_sys::fuzz_target;
 
 // Fuzz arithmetic operations.
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 16 {
+    // Need at least 18 bytes: 16 for two u64 values + 2 for shift/exponent.
+    if data.len() < 18 {
         return;
     }
 
