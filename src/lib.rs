@@ -14,6 +14,10 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::result_unit_err)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::collapsible_if)]
 
 use core::cmp::Ordering;
 use core::fmt;
@@ -637,7 +641,7 @@ impl Mpz {
     ///
     /// This is the safe, public way to construct an `Mpz` from raw limb data.
     pub fn from_limbs_checked(sign: i8, limbs: &[u64]) -> Option<Mpz> {
-        if sign < -1 || sign > 1 {
+        if !(-1..=1).contains(&sign) {
             return None;
         }
         if limbs.len() > LIMBS {
@@ -704,7 +708,7 @@ impl Mpz {
 
         // Normal value: mantissa = 1.xxx (53 bits including implicit 1)
         let mut full_mant = (1u128 << 52) | mant as u128; // 53-bit mantissa
-        let mut total_exp = exp as i32;
+        let mut total_exp = exp;
 
         // We have value = full_mant * 2^(total_exp - 52)
         total_exp -= 52;
@@ -736,7 +740,7 @@ impl Mpz {
         if total_exp > 0 {
             let shift = total_exp as u32;
             let bits_needed = 53 + shift;
-            let limbs_needed = ((bits_needed + 63) / 64) as usize;
+            let limbs_needed = bits_needed.div_ceil(64) as usize;
             if limbs_needed > MPZ_MAX_LIMBS {
                 return Err(CapacityError);
             }
@@ -1608,8 +1612,8 @@ impl Mpz {
     pub fn cdiv_r_2exp(&self, bits: u32) -> Mpz {
         let q = self.cdiv_q_2exp(bits);
         let q_times_mod = q.try_mul_2exp(bits).unwrap_or_else(|_| Mpz::new());
-        let r = self.try_sub(&q_times_mod).unwrap_or_else(|_| Mpz::new());
-        r
+
+        self.try_sub(&q_times_mod).unwrap_or_else(|_| Mpz::new())
     }
 
     /// `mpz_tdiv_qr_ui`: truncating quotient and remainder by u64. Returns (q, r).
@@ -1738,7 +1742,7 @@ impl Mpz {
         if bits == 0 {
             return 0;
         }
-        let n_limbs = ((bits + 63) / 64) as usize;
+        let n_limbs = bits.div_ceil(64) as usize;
         let n_limbs_for_mask = n_limbs.min(MPZ_MAX_LIMBS);
         let _limb_mask_bits = bits % 64;
 
@@ -2889,7 +2893,7 @@ impl Mpz {
         }
 
         // The maximum number of limbs we could need is ceil(count * size / 8)
-        let max_limbs = (count * size + 7) / 8;
+        let max_limbs = (count * size).div_ceil(8);
         if max_limbs > MPZ_MAX_LIMBS {
             return Err(CapacityError);
         }
@@ -2957,7 +2961,7 @@ impl Mpz {
         }
 
         let mut r = Mpz::new();
-        let _n_limbs = (count * size + 7) / 8;
+        let _n_limbs = (count * size).div_ceil(8);
         let n_limbs_actual = if bit_offset > 0 {
             limb_idx + 1
         } else {
@@ -2996,9 +3000,9 @@ impl Mpz {
 
         // Determine total bytes needed
         let total_bits = self.sizeinbase2();
-        let total_bytes = (total_bits + 7) / 8;
+        let total_bytes = total_bits.div_ceil(8);
         let chunk_bytes = size;
-        let n_chunks = (total_bytes + chunk_bytes - 1) / chunk_bytes;
+        let n_chunks = total_bytes.div_ceil(chunk_bytes);
         let needed_bytes = n_chunks * chunk_bytes;
 
         if buf.len() < needed_bytes {
@@ -3039,14 +3043,13 @@ impl Mpz {
 
         // If no transformation is needed:
         if order == Endian::Little || (order == Endian::Native && native_endian == Endian::Little) {
-            if endian == Endian::Little
-                || (endian == Endian::Native && native_endian == Endian::Little)
+            if (endian == Endian::Little
+                || (endian == Endian::Native && native_endian == Endian::Little))
+                && (size == 1 || size == 0)
             {
-                if size == 1 || size == 0 {
-                    return Some(needed_bytes);
-                }
-                // We still need to handle chunk size
+                return Some(needed_bytes);
             }
+            // We still need to handle chunk size
         }
 
         // Convert by processing chunk by chunk.
@@ -3138,7 +3141,7 @@ impl Mpz {
                 if p * p > v {
                     break;
                 }
-                if v % p == 0 {
+                if v.is_multiple_of(p) {
                     return Ok(if v == p { 2 } else { 0 });
                 }
             }
@@ -3452,7 +3455,7 @@ impl Mpz {
     /// - `gmp_name`: the GMP C function name, e.g. `"mpz_add"`.
     /// - `status`: short description, e.g. `"yes"`, `"partial"`, `"no (requires std)"`.
     pub fn capability_map() -> &'static [(i32, &'static str, &'static str)] {
-        &CAPABILITY_TABLE
+        CAPABILITY_TABLE
     }
 
     // =======================================================================

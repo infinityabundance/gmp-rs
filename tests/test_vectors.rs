@@ -77,10 +77,7 @@ fn sub_vectors() {
         "55"
     );
     // Result zero
-    assert_mpz_eq!(
-        Mpz::from_u64(42).try_sub(&Mpz::from_u64(42)).unwrap(),
-        "0"
-    );
+    assert_mpz_eq!(Mpz::from_u64(42).try_sub(&Mpz::from_u64(42)).unwrap(), "0");
     // Negative result
     assert_mpz_eq!(
         Mpz::from_u64(10).try_sub(&Mpz::from_u64(100)).unwrap(),
@@ -106,25 +103,16 @@ fn sub_vectors() {
 #[test]
 fn mul_vectors() {
     // Basic
-    assert_mpz_eq!(
-        Mpz::from_u64(7).try_mul(&Mpz::from_u64(8)).unwrap(),
-        "56"
-    );
+    assert_mpz_eq!(Mpz::from_u64(7).try_mul(&Mpz::from_u64(8)).unwrap(), "56");
     // Zero
-    assert_mpz_eq!(
-        Mpz::from_u64(12345).try_mul(&Mpz::new()).unwrap(),
-        "0"
-    );
+    assert_mpz_eq!(Mpz::from_u64(12345).try_mul(&Mpz::new()).unwrap(), "0");
     // Negative * negative = positive
     assert_mpz_eq!(
         Mpz::from_i64(-12).try_mul(&Mpz::from_i64(-12)).unwrap(),
         "144"
     );
     // Negative * positive = negative
-    assert_mpz_eq!(
-        Mpz::from_i64(-7).try_mul(&Mpz::from_u64(6)).unwrap(),
-        "-42"
-    );
+    assert_mpz_eq!(Mpz::from_i64(-7).try_mul(&Mpz::from_u64(6)).unwrap(), "-42");
     // 2^100 * 2^100 = 2^200
     assert_mpz_eq!(
         Mpz::from_u64(1)
@@ -173,15 +161,11 @@ fn tdiv_vectors() {
 
 #[test]
 fn fdiv_vectors() {
-    let (q, r) = Mpz::from_i64(-100)
-        .try_fdiv_qr(&Mpz::from_u64(30))
-        .unwrap();
+    let (q, r) = Mpz::from_i64(-100).try_fdiv_qr(&Mpz::from_u64(30)).unwrap();
     assert_mpz_eq!(q, "-4");
     assert_mpz_eq!(r, "20");
 
-    let (q, r) = Mpz::from_i64(100)
-        .try_fdiv_qr(&Mpz::from_i64(-30))
-        .unwrap();
+    let (q, r) = Mpz::from_i64(100).try_fdiv_qr(&Mpz::from_i64(-30)).unwrap();
     assert_mpz_eq!(q, "-4");
     assert_mpz_eq!(r, "-20");
 }
@@ -192,15 +176,11 @@ fn fdiv_vectors() {
 
 #[test]
 fn cdiv_vectors() {
-    let (q, r) = Mpz::from_i64(-100)
-        .try_cdiv_qr(&Mpz::from_u64(30))
-        .unwrap();
+    let (q, r) = Mpz::from_i64(-100).try_cdiv_qr(&Mpz::from_u64(30)).unwrap();
     assert_mpz_eq!(q, "-3");
     assert_mpz_eq!(r, "-10");
 
-    let (q, r) = Mpz::from_i64(100)
-        .try_cdiv_qr(&Mpz::from_i64(-30))
-        .unwrap();
+    let (q, r) = Mpz::from_i64(100).try_cdiv_qr(&Mpz::from_i64(-30)).unwrap();
     assert_mpz_eq!(q, "-3");
     assert_mpz_eq!(r, "10");
 }
@@ -219,10 +199,7 @@ fn mod_vectors() {
         Mpz::from_i64(100).try_mod(&Mpz::from_u64(30)).unwrap(),
         "10"
     );
-    assert_mpz_eq!(
-        Mpz::from_i64(-17).try_mod(&Mpz::from_u64(5)).unwrap(),
-        "3"
-    );
+    assert_mpz_eq!(Mpz::from_i64(-17).try_mod(&Mpz::from_u64(5)).unwrap(), "3");
 }
 
 // ==========================================================================
@@ -231,18 +208,9 @@ fn mod_vectors() {
 
 #[test]
 fn gcd_vectors() {
-    assert_mpz_eq!(
-        Mpz::from_u64(12).try_gcd(&Mpz::from_u64(18)).unwrap(),
-        "6"
-    );
-    assert_mpz_eq!(
-        Mpz::from_u64(0).try_gcd(&Mpz::from_u64(5)).unwrap(),
-        "5"
-    );
-    assert_mpz_eq!(
-        Mpz::from_u64(7).try_gcd(&Mpz::from_u64(13)).unwrap(),
-        "1"
-    );
+    assert_mpz_eq!(Mpz::from_u64(12).try_gcd(&Mpz::from_u64(18)).unwrap(), "6");
+    assert_mpz_eq!(Mpz::from_u64(0).try_gcd(&Mpz::from_u64(5)).unwrap(), "5");
+    assert_mpz_eq!(Mpz::from_u64(7).try_gcd(&Mpz::from_u64(13)).unwrap(), "1");
     assert_mpz_eq!(
         Mpz::from_u64(2700).try_gcd(&Mpz::from_u64(192)).unwrap(),
         "12"
@@ -251,14 +219,8 @@ fn gcd_vectors() {
 
 #[test]
 fn lcm_vectors() {
-    assert_mpz_eq!(
-        Mpz::from_u64(12).try_lcm(&Mpz::from_u64(18)).unwrap(),
-        "36"
-    );
-    assert_mpz_eq!(
-        Mpz::from_u64(0).try_lcm(&Mpz::from_u64(5)).unwrap(),
-        "0"
-    );
+    assert_mpz_eq!(Mpz::from_u64(12).try_lcm(&Mpz::from_u64(18)).unwrap(), "36");
+    assert_mpz_eq!(Mpz::from_u64(0).try_lcm(&Mpz::from_u64(5)).unwrap(), "0");
 }
 
 #[test]
@@ -417,10 +379,7 @@ fn parse_error_vectors() {
         Mpz::from_decimal_str("12a34"),
         Err(ParseError::InvalidInput)
     );
-    assert_eq!(
-        Mpz::from_decimal_str("   "),
-        Err(ParseError::InvalidInput)
-    );
+    assert_eq!(Mpz::from_decimal_str("   "), Err(ParseError::InvalidInput));
 }
 
 // ==========================================================================
@@ -434,7 +393,10 @@ fn from_d_vectors() {
     assert_eq!(Mpz::from_d(-1.0).unwrap(), Mpz::from_i64(-1));
     assert_eq!(Mpz::from_d(3.999).unwrap(), Mpz::from_u64(3));
     assert_eq!(Mpz::from_d(-3.999).unwrap(), Mpz::from_i64(-3));
-    assert_eq!(Mpz::from_d(1e18).unwrap(), Mpz::from_u64(1000000000000000000));
+    assert_eq!(
+        Mpz::from_d(1e18).unwrap(),
+        Mpz::from_u64(1000000000000000000)
+    );
     assert_eq!(Mpz::from_d(f64::INFINITY), Err(CapacityError));
     assert_eq!(Mpz::from_d(f64::NEG_INFINITY), Err(CapacityError));
     assert_eq!(Mpz::from_d(f64::NAN), Err(CapacityError));
@@ -450,20 +412,8 @@ fn cmp_vectors() {
     assert_eq!(Mpz::from_u64(5).cmp(&Mpz::from_u64(3)), Ordering::Greater);
     assert_eq!(Mpz::from_u64(3).cmp(&Mpz::from_u64(5)), Ordering::Less);
     assert_eq!(Mpz::from_u64(5).cmp(&Mpz::from_u64(5)), Ordering::Equal);
-    assert_eq!(
-        Mpz::from_i64(-5).cmp(&Mpz::from_u64(3)),
-        Ordering::Less
-    );
-    assert_eq!(
-        Mpz::from_i64(-5).cmp(&Mpz::from_i64(-3)),
-        Ordering::Less
-    );
-    assert_eq!(
-        Mpz::from_i64(-3).cmp_si(-3),
-        Ordering::Equal
-    );
-    assert_eq!(
-        Mpz::from_u64(5).cmp_ui(10),
-        Ordering::Less
-    );
+    assert_eq!(Mpz::from_i64(-5).cmp(&Mpz::from_u64(3)), Ordering::Less);
+    assert_eq!(Mpz::from_i64(-5).cmp(&Mpz::from_i64(-3)), Ordering::Less);
+    assert_eq!(Mpz::from_i64(-3).cmp_si(-3), Ordering::Equal);
+    assert_eq!(Mpz::from_u64(5).cmp_ui(10), Ordering::Less);
 }

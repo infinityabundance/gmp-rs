@@ -140,18 +140,6 @@ fn replay_capacity_boundary() {
     let two_pow_511 = Mpz::from_u64(1).try_mul_2exp(511).unwrap();
     assert_eq!(two_pow_511.sizeinbase2(), 512);
 
-    // Build max = 2^512 - 1 by: (2^511 - 1)*2 + 1 = 2^512 - 1
-    // 2^511 - 1 fits in 511 bits
-    let max_minus_511 = two_pow_511.try_sub(&Mpz::from_u64(1)).unwrap();
-    // 2^511 - 1 + 2^511 = 2^512 - 1 (but this overflows because 2^512 needs 9 limbs)
-    // Actually let's just test the boundary directly:
-    // A value with bit 511 set and all lower bits set = 2^512 - 1, which is max.
-    // But 2^511 + (2^511 - 1) = 2^512 - 1... but 2^511 + 2^511 = 2^512 which overflows.
-    // So we CAN'T construct the full max with shifts alone.
-
-    // Instead, test: max-1 fits, and max-1 + 1 overflows if max-1 has 511 bits set
-    // Actually, the safest test: a value known to exercise the boundary
-
     // 2^255 should easily fit (256 bits)
     let two_pow_255 = Mpz::from_u64(1).try_mul_2exp(255).unwrap();
     assert!(two_pow_255.sizeinbase2() <= 512);
