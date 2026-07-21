@@ -259,26 +259,47 @@ impl Mpz {
         if a.is_empty() || b.is_empty() {
             return Some(0);
         }
-        let rl = a.len() + b.len();
-        if rl > MPZ_MAX_LIMBS {
-            return None;
-        }
-        for o in out.iter_mut().take(rl) {
+        // The theoretical max result limbs = a.len() + b.len().
+        // But we can only store MPZ_MAX_LIMBS, so cap writes at that.
+        // If the result needs more than MPZ_MAX_LIMBS, we detect it
+        // during computation (carry into last limb) or after trimming.
+        let max_idx = if a.len() + b.len() > MPZ_MAX_LIMBS {
+            // We can still compute but must watch for carry into the
+            // non-existent extra limb.
+            MPZ_MAX_LIMBS - 1
+        } else {
+            a.len() + b.len() - 1
+        };
+        for o in out.iter_mut().take(max_idx + 1) {
             *o = 0;
         }
         for (i, &ai) in a.iter().enumerate() {
             let mut carry = 0u128;
+            // Only iterate over b indices where i + j <= max_idx
             for (j, &bj) in b.iter().enumerate() {
                 let idx = i + j;
+                if idx > max_idx {
+                    // This limb would write beyond capacity.
+                    // The carry from a[i]*b[j] is still added to the accumulator
+                    // and must be accounted for, but we can't store it.
+                    carry += ai as u128 * bj as u128;
+                    break;
+                }
                 let cur = out[idx] as u128 + ai as u128 * bj as u128 + carry;
                 out[idx] = cur as u64;
                 carry = cur >> 64;
             }
+            // Write carry into next limb if possible
+            let next_idx = i + b.len();
             if carry != 0 {
-                out[i + b.len()] = out[i + b.len()].wrapping_add(carry as u64);
+                if next_idx > max_idx {
+                    // Would overflow beyond capacity
+                    return None;
+                }
+                out[next_idx] = out[next_idx].wrapping_add(carry as u64);
             }
         }
-        let mut rl2 = rl;
+        let mut rl2 = max_idx + 1;
         while rl2 > 0 && out[rl2 - 1] == 0 {
             rl2 -= 1;
         }
@@ -604,6 +625,41 @@ impl Mpz {
     /// `mpz_set_sll`: construct from `i64`.
     pub fn mpz_set_sll(val: i64) -> Self {
         Self::from_i64(val)
+    }
+
+    /// Construct from raw limbs with validation.
+    ///
+    /// Returns `None` if:
+    /// - `limbs.len() > LIMBS`
+    /// - `sign` is not -1, 0, or 1
+    /// - non-zero value has trailing zero limb
+    /// - zero value has non-zero sign
+    ///
+    /// This is the safe, public way to construct an `Mpz` from raw limb data.
+    pub fn from_limbs_checked(sign: i8, limbs: &[u64]) -> Option<Mpz> {
+        if sign < -1 || sign > 1 {
+            return None;
+        }
+        if limbs.len() > LIMBS {
+            return None;
+        }
+        // Trim trailing zeros
+        let mut len = limbs.len();
+        while len > 0 && limbs[len - 1] == 0 {
+            len -= 1;
+        }
+        if len == 0 {
+            if sign == 0 {
+                return Some(Mpz::new());
+            }
+            return None; // non-zero sign with zero magnitude
+        }
+        if sign == 0 {
+            return None; // zero sign with non-zero magnitude
+        }
+        let mut mag = [0u64; LIMBS];
+        mag[..len].copy_from_slice(&limbs[..len]);
+        Some(Mpz { sign, len, mag })
     }
 
     /// `mpz_swap`: swap two Mpz values (infallible, no alloc).

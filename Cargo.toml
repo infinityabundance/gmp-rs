@@ -1,6 +1,6 @@
 [package]
 name = "gmp-rs"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 description = "A pure-Rust, no-unsafe, no_std, no_alloc arbitrary-precision integer (mpz) subset, faithful to GMP's mpz_* operations."
 license = "LGPL-3.0-or-later"
@@ -8,7 +8,7 @@ repository = "https://github.com/infinityabundance/gmp-rs"
 documentation = "https://docs.rs/gmp-rs"
 readme = "README.md"
 keywords = ["gmp", "bignum", "arbitrary-precision", "bigint", "no-alloc"]
-categories = ["algorithms", "data-structures", "no-std", "mathematics"]
+categories = ["algorithms", "data-structures", "mathematics", "no-std", "science"]
 
 [features]
 default = []
@@ -19,6 +19,7 @@ gmp_cross_check = []
 
 [dev-dependencies]
 proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [build-dependencies]
 cc = { version = "1", optional = true }
@@ -28,3 +29,7 @@ cc = { version = "1", optional = true }
 
 [package.metadata.cargo-fuzz]
 target_directory = "fuzz"
+
+[[bench]]
+name = "arithmetic"
+harness = false
